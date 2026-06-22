@@ -1,1 +1,5 @@
 /target
+
+# agent-deck orchestration scratch (worker reports, task briefs) — not part of brim
+/.dot-agent-deck
+/.dot-agent-deck.toml

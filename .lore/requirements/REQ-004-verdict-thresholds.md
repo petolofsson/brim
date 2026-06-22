@@ -1,7 +1,7 @@
 ---
 id: REQ-004
 title: Verdict thresholds
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
 related_adrs:

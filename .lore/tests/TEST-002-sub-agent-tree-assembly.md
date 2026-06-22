@@ -1,7 +1,7 @@
 ---
 id: TEST-002
 title: Sub-agent tree assembly
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-002

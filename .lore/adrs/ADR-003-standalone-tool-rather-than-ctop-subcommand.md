@@ -1,7 +1,7 @@
 ---
 id: ADR-003
 title: Standalone tool rather than ctop subcommand
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-002

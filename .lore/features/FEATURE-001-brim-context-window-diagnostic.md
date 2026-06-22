@@ -7,6 +7,8 @@ related_requirements:
   - REQ-002
   - REQ-003
   - REQ-004
+  - REQ-005
+  - REQ-006
 related_adrs:
   - ADR-001
   - ADR-002
@@ -37,6 +39,7 @@ For Claude Code it assembles a parent -> sub-agent tree (see ADR-001); Codex and
 - `brim --once`: single plain-text snapshot (default); a watch/refresh mode may follow.
 - Providers: Claude Code, Codex, Copilot — discovery + last-turn window read.
 - Per-model window limits (e.g. 200k / 1M) resolved from the session model.
+- Machine-readable `--json` output and active/recency filtering (default active-only, `--all` for historical) for programmatic orchestration.
 
 ## Out of Scope
 

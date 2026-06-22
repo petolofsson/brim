@@ -1,7 +1,7 @@
 ---
 id: ADR-001
 title: Sub-agent tree from Claude transcript layout
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-002

@@ -1,3 +1,560 @@
-fn main() {
-    println!("Hello, world!");
+mod claude;
+mod model;
+mod parser;
+mod provider;
+mod verdict;
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use clap::Parser;
+use claude::ClaudeProvider;
+use model::SessionNode;
+use parser::short_id;
+use provider::Provider;
+use serde::Serialize;
+use verdict::Thresholds;
+
+const PROJECT_COL_WIDTH: usize = 28;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "brim",
+    about = "Context-window occupancy for AI coding sessions"
+)]
+struct Cli {
+    /// Show orchestrator → sub-agent tree
+    #[arg(long)]
+    tree: bool,
+
+    /// Scope output to one session and its sub-agents
+    #[arg(long)]
+    session: Option<String>,
+
+    /// Single snapshot (default behavior; accepted for compatibility)
+    #[arg(long)]
+    once: bool,
+
+    /// Fill % at which verdict becomes 'nearing' (default: 70)
+    #[arg(long, default_value_t = 70)]
+    nearing: u8,
+
+    /// Fill % at which verdict becomes 'over -> recycle' (default: 90)
+    #[arg(long, default_value_t = 90)]
+    ceiling: u8,
+
+    /// Emit structured JSON to stdout instead of human-readable text (REQ-005)
+    #[arg(long)]
+    json: bool,
+
+    /// Include stale/historical sessions; default shows active sessions only (REQ-006)
+    #[arg(long)]
+    all: bool,
+
+    /// Minutes since last turn for a session to be considered active (default: 30) (REQ-006)
+    #[arg(long, default_value_t = 30)]
+    active_mins: u32,
+}
+
+#[derive(Serialize)]
+struct JsonOutput {
+    generated_at: String,
+    nodes: Vec<JsonNode>,
+}
+
+#[derive(Serialize)]
+struct JsonNode {
+    session_id: String,
+    parent_session_id: Option<String>,
+    agent_id: Option<String>,
+    project: String,
+    model: Option<String>,
+    context_limit: Option<u64>,
+    window_tokens: Option<u64>,
+    fill_percent: Option<u8>,
+    verdict: Option<&'static str>,
+    last_turn_at: Option<String>,
+    active: bool,
+    children: Vec<JsonNode>,
+}
+
+fn is_active(node: &SessionNode, active_mins: u32) -> bool {
+    match node.last_turn_at {
+        None => false,
+        Some(ts) => Utc::now().signed_duration_since(ts).num_minutes() <= active_mins as i64,
+    }
+}
+
+fn any_active(node: &SessionNode, active_mins: u32) -> bool {
+    is_active(node, active_mins) || node.children.iter().any(|c| is_active(c, active_mins))
+}
+
+fn age_str(last_turn_at: Option<DateTime<Utc>>) -> String {
+    let Some(ts) = last_turn_at else {
+        return "-".to_string();
+    };
+    let secs = Utc::now().signed_duration_since(ts).num_seconds();
+    if secs < 0 {
+        return "0m".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        format!("{mins}m")
+    } else if mins < 60 * 24 {
+        format!("{}h", mins / 60)
+    } else {
+        let days = mins / (60 * 24);
+        if days >= 1000 {
+            ">999d".to_string()
+        } else {
+            format!("{}d", days)
+        }
+    }
+}
+
+/// Truncate to PROJECT_COL_WIDTH chars, appending '…' if clipped.
+fn truncate_project(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= PROJECT_COL_WIDTH {
+        s.to_string()
+    } else {
+        let truncated: String = chars.into_iter().take(PROJECT_COL_WIDTH - 1).collect();
+        format!("{truncated}\u{2026}")
+    }
+}
+
+fn to_json_node(
+    node: &SessionNode,
+    parent_uuid: Option<&str>,
+    thresholds: &Thresholds,
+    active_mins: u32,
+) -> JsonNode {
+    let (window_tokens, fill_percent, model, context_limit, verdict) = node
+        .window
+        .as_ref()
+        .map(|w| {
+            (
+                Some(w.window_tokens),
+                Some(w.fill_percent),
+                Some(w.model.clone()),
+                Some(w.context_limit),
+                Some(thresholds.verdict(w.fill_percent).as_json_str()),
+            )
+        })
+        .unwrap_or((None, None, None, None, None));
+
+    // For sub-agents: session_id = agent_id (the sub-agent's own UUID).
+    // For roots: session_id = session_uuid.
+    let session_id = node
+        .agent_id
+        .as_deref()
+        .unwrap_or(&node.session_uuid)
+        .to_string();
+
+    JsonNode {
+        session_id,
+        parent_session_id: parent_uuid.map(|s| s.to_string()),
+        agent_id: node.agent_id.clone(),
+        project: node.project_key.clone(),
+        model,
+        context_limit,
+        window_tokens,
+        fill_percent,
+        verdict,
+        last_turn_at: node.last_turn_at.map(|ts| ts.to_rfc3339()),
+        active: is_active(node, active_mins),
+        children: node
+            .children
+            .iter()
+            .map(|c| to_json_node(c, Some(&node.session_uuid), thresholds, active_mins))
+            .collect(),
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    anyhow::ensure!(
+        cli.nearing <= cli.ceiling && cli.ceiling <= 100,
+        "--nearing ({}) must be \u{2264} --ceiling ({}) and --ceiling must be \u{2264} 100",
+        cli.nearing,
+        cli.ceiling,
+    );
+    let thresholds = Thresholds {
+        nearing: cli.nearing,
+        ceiling: cli.ceiling,
+    };
+
+    let provider = ClaudeProvider::new();
+    if !provider.is_available() {
+        println!("claude: no sessions (provider unavailable)");
+        return Ok(());
+    }
+
+    let mut sessions = provider.load_sessions();
+
+    if let Some(id) = &cli.session {
+        sessions.retain(|s| {
+            s.session_uuid.starts_with(id.as_str())
+                || short_id(&s.session_uuid).contains(id.as_str())
+        });
+        if sessions.is_empty() {
+            eprintln!("brim: no session matching '{id}'");
+            return Ok(());
+        }
+    }
+
+    if !cli.all && cli.session.is_none() {
+        sessions.retain(|s| any_active(s, cli.active_mins));
+    }
+
+    if cli.json {
+        let output = JsonOutput {
+            generated_at: Utc::now().to_rfc3339(),
+            nodes: sessions
+                .iter()
+                .map(|s| to_json_node(s, None, &thresholds, cli.active_mins))
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    if cli.tree {
+        print_tree(&sessions, &thresholds);
+    } else {
+        print_flat(&sessions, &thresholds);
+    }
+
+    Ok(())
+}
+
+fn tokens_str(node: &SessionNode) -> String {
+    node.window
+        .as_ref()
+        .map(|w| w.window_tokens.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn fill_str(node: &SessionNode) -> String {
+    node.window
+        .as_ref()
+        .map(|w| format!("{}%", w.fill_percent))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn verdict_str<'a>(node: &SessionNode, thresholds: &'a Thresholds) -> &'a str {
+    node.window
+        .as_ref()
+        .map(|w| thresholds.verdict(w.fill_percent).as_str())
+        .unwrap_or("-")
+}
+
+fn model_str(node: &SessionNode) -> &str {
+    node.window
+        .as_ref()
+        .and_then(|w| {
+            if w.model.is_empty() {
+                None
+            } else {
+                Some(w.model.as_str())
+            }
+        })
+        .unwrap_or("-")
+}
+
+fn project_str(node: &SessionNode) -> &str {
+    if node.project_key.is_empty() {
+        "-"
+    } else {
+        &node.project_key
+    }
+}
+
+fn print_flat(sessions: &[SessionNode], thresholds: &Thresholds) {
+    println!(
+        "{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} MODEL",
+        "SESSION", "TOKENS", "FILL", "VERDICT", "AGE", "PROJECT"
+    );
+    for s in sessions {
+        let id = short_id(&s.session_uuid);
+        let sub = if s.children.is_empty() {
+            String::new()
+        } else {
+            format!("  [{} sub-agent(s)]", s.children.len())
+        };
+        println!(
+            "{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} {}{}",
+            id,
+            tokens_str(s),
+            fill_str(s),
+            verdict_str(s, thresholds),
+            age_str(s.last_turn_at),
+            truncate_project(project_str(s)),
+            model_str(s),
+            sub,
+        );
+    }
+}
+
+fn print_tree(sessions: &[SessionNode], thresholds: &Thresholds) {
+    for s in sessions {
+        println!(
+            "{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} {}",
+            short_id(&s.session_uuid),
+            tokens_str(s),
+            fill_str(s),
+            verdict_str(s, thresholds),
+            age_str(s.last_turn_at),
+            truncate_project(project_str(s)),
+            model_str(s),
+        );
+        let last = s.children.len().saturating_sub(1);
+        for (i, child) in s.children.iter().enumerate() {
+            let conn = if i < last { "├──" } else { "└──" };
+            let child_id = child
+                .agent_id
+                .as_deref()
+                .map(short_id)
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {} agent:{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} {}",
+                conn,
+                child_id,
+                tokens_str(child),
+                fill_str(child),
+                verdict_str(child, thresholds),
+                age_str(child.last_turn_at),
+                "",
+                model_str(child),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::WindowInfo;
+
+    fn make_node_with_ts(last_turn_at: Option<DateTime<Utc>>) -> SessionNode {
+        SessionNode {
+            session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
+            agent_id: None,
+            project_key: "test-project".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 100_000,
+                fill_percent: 50,
+                model: "claude-sonnet-4-6".to_string(),
+                context_limit: 200_000,
+            }),
+            children: Vec::new(),
+            last_turn_at,
+        }
+    }
+
+    #[test]
+    fn test_recency_active_recent_timestamp() {
+        // 10 minutes ago → active under 30-minute threshold
+        let ts = Utc::now() - chrono::Duration::minutes(10);
+        assert!(is_active(&make_node_with_ts(Some(ts)), 30));
+    }
+
+    #[test]
+    fn test_recency_inactive_old_timestamp() {
+        // 60 minutes ago → inactive under 30-minute threshold
+        let ts = Utc::now() - chrono::Duration::minutes(60);
+        assert!(!is_active(&make_node_with_ts(Some(ts)), 30));
+    }
+
+    #[test]
+    fn test_recency_inactive_missing_timestamp() {
+        assert!(!is_active(&make_node_with_ts(None), 30));
+    }
+
+    #[test]
+    fn test_default_filter_excludes_stale_includes_active() {
+        let active = make_node_with_ts(Some(Utc::now() - chrono::Duration::minutes(5)));
+        let mut stale = make_node_with_ts(Some(Utc::now() - chrono::Duration::hours(2)));
+        stale.session_uuid = "bbbbcccc-dddd-eeee-ffff-000011112222".to_string();
+
+        let mut sessions = vec![active.clone(), stale.clone()];
+        sessions.retain(|s| is_active(s, 30));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_uuid, active.session_uuid);
+
+        // --all: both returned (no filter applied)
+        let sessions_all = [active, stale];
+        assert_eq!(sessions_all.len(), 2);
+    }
+
+    #[test]
+    fn test_json_full_id_nested_children_no_transcript_content() {
+        let thresholds = Thresholds::default();
+        let parent_uuid = "aaaabbbb-cccc-dddd-eeee-111122223333";
+        let child_agent_id = "ffff0000-1111-2222-3333-444455556666";
+
+        let child = SessionNode {
+            session_uuid: parent_uuid.to_string(),
+            agent_id: Some(child_agent_id.to_string()),
+            project_key: "test-project".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 10_000,
+                fill_percent: 5,
+                model: "claude-sonnet-4-6".to_string(),
+                context_limit: 200_000,
+            }),
+            children: Vec::new(),
+            last_turn_at: None,
+        };
+
+        let parent = SessionNode {
+            session_uuid: parent_uuid.to_string(),
+            agent_id: None,
+            project_key: "test-project".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 142_000,
+                fill_percent: 71,
+                model: "claude-sonnet-4-6".to_string(),
+                context_limit: 200_000,
+            }),
+            children: vec![child],
+            last_turn_at: None,
+        };
+
+        let jnode = to_json_node(&parent, None, &thresholds, 30);
+
+        // Full untruncated ID
+        assert_eq!(jnode.session_id, parent_uuid);
+        assert_eq!(jnode.parent_session_id, None);
+        assert_eq!(jnode.agent_id, None);
+        assert_eq!(jnode.fill_percent, Some(71));
+        assert_eq!(jnode.verdict, Some("nearing"));
+        assert!(jnode.fill_percent <= Some(100));
+        assert_eq!(jnode.children.len(), 1);
+
+        let child_j = &jnode.children[0];
+        assert_eq!(child_j.session_id, child_agent_id);
+        assert_eq!(child_j.parent_session_id, Some(parent_uuid.to_string()));
+        assert_eq!(child_j.agent_id, Some(child_agent_id.to_string()));
+
+        // No transcript content in serialized output
+        let json_str = serde_json::to_string(&jnode).unwrap();
+        assert!(!json_str.contains("message"));
+        assert!(!json_str.contains("content"));
+        assert!(!json_str.contains("prompt"));
+    }
+
+    #[test]
+    fn test_json_verdict_over_recycle_string() {
+        let thresholds = Thresholds::default();
+        let node = SessionNode {
+            session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
+            agent_id: None,
+            project_key: "test".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 190_000,
+                fill_percent: 95,
+                model: "claude-sonnet-4-6".to_string(),
+                context_limit: 200_000,
+            }),
+            children: Vec::new(),
+            last_turn_at: None,
+        };
+        let jnode = to_json_node(&node, None, &thresholds, 30);
+        assert_eq!(jnode.verdict, Some("over_recycle"));
+    }
+
+    #[test]
+    fn test_truncate_project_short_passthrough() {
+        let short = "home-pol-code-brim";
+        assert_eq!(truncate_project(short), short);
+    }
+
+    #[test]
+    fn test_truncate_project_long_clips_to_width() {
+        let long = "home-pol-code-very-long-project-name-here";
+        let result = truncate_project(long);
+        let char_count = result.chars().count();
+        assert_eq!(char_count, PROJECT_COL_WIDTH);
+        assert!(result.ends_with('\u{2026}'));
+    }
+
+    // S1: stale parent + active child → both retained by default filter.
+    #[test]
+    fn test_default_filter_retains_stale_parent_with_active_child() {
+        let child = SessionNode {
+            session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
+            agent_id: Some("child000-1111-2222-3333-444455556666".to_string()),
+            project_key: "test-project".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 50_000,
+                fill_percent: 25,
+                model: "claude-sonnet-4-6".to_string(),
+                context_limit: 200_000,
+            }),
+            children: Vec::new(),
+            last_turn_at: Some(Utc::now() - chrono::Duration::minutes(5)),
+        };
+        let parent = SessionNode {
+            session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
+            agent_id: None,
+            project_key: "test-project".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 100_000,
+                fill_percent: 50,
+                model: "claude-sonnet-4-6".to_string(),
+                context_limit: 200_000,
+            }),
+            children: vec![child],
+            last_turn_at: Some(Utc::now() - chrono::Duration::hours(2)),
+        };
+        let mut sessions = vec![parent];
+        sessions.retain(|s| any_active(s, 30));
+        assert_eq!(
+            sessions.len(),
+            1,
+            "stale parent with active child must be retained"
+        );
+        assert_eq!(sessions[0].children.len(), 1);
+    }
+
+    // S2: --session bypasses active filter; stale session must still appear.
+    #[test]
+    fn test_session_flag_bypasses_active_filter() {
+        let stale = make_node_with_ts(Some(Utc::now() - chrono::Duration::hours(2)));
+        // Without --session: active filter removes stale session
+        let mut sessions = vec![stale.clone()];
+        sessions.retain(|s| any_active(s, 30));
+        assert_eq!(
+            sessions.len(),
+            0,
+            "stale must be filtered without --session"
+        );
+        // With --session: no active filter applied → session is retained
+        let retained = [stale];
+        assert_eq!(retained.len(), 1, "stale must be retained with --session");
+    }
+
+    // M1: no-window node must emit null for model, context_limit, window_tokens, fill_percent, verdict.
+    #[test]
+    fn test_json_null_fields_when_no_window() {
+        let thresholds = Thresholds::default();
+        let node = SessionNode {
+            session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
+            agent_id: None,
+            project_key: "test".to_string(),
+            window: None,
+            children: Vec::new(),
+            last_turn_at: None,
+        };
+        let jnode = to_json_node(&node, None, &thresholds, 30);
+        assert_eq!(jnode.model, None);
+        assert_eq!(jnode.context_limit, None);
+        assert_eq!(jnode.window_tokens, None);
+        assert_eq!(jnode.fill_percent, None);
+        assert_eq!(jnode.verdict, None);
+        let json_str = serde_json::to_string(&jnode).unwrap();
+        assert!(json_str.contains("\"model\":null"));
+        assert!(json_str.contains("\"context_limit\":null"));
+        assert!(json_str.contains("\"verdict\":null"));
+    }
 }

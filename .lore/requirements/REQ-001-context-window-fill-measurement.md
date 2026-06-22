@@ -1,7 +1,7 @@
 ---
 id: REQ-001
 title: Context-window fill measurement
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
 related_adrs:

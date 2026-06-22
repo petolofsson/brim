@@ -1,7 +1,7 @@
 ---
 id: TEST-001
 title: Window-fill computation from last turn
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-001

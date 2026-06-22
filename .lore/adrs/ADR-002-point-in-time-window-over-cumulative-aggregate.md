@@ -1,11 +1,12 @@
 ---
 id: ADR-002
 title: Point-in-time window over cumulative aggregate
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-001
   - REQ-004
+  - REQ-007
 related_adrs:
   - ADR-001
   - ADR-003
