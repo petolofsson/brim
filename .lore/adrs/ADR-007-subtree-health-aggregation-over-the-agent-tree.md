@@ -1,7 +1,7 @@
 ---
 id: ADR-007
 title: Subtree health aggregation over the agent tree
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-003
   - REQ-007
@@ -47,6 +47,10 @@ and reads no message content.
   subtree == self with no special-casing.
 * The per-metric rules keep the aggregate faithful — independent windows are not
   averaged into a meaningless single ratio.
+* **Cost-sum rule is N/A / not implemented** for brim's current data model: brim
+  reads point-in-time window occupancy, not aggregate spend (ADR-002), so no
+  cost/spend source exists to sum. The Decision's cost rule is retained as intent
+  but is inert until a spend source is ever added; revisit then.
 
 ## Alternatives Considered
 
