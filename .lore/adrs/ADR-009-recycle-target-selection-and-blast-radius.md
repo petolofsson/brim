@@ -1,7 +1,7 @@
 ---
 id: ADR-009
 title: Recycle-target selection and blast radius
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-003
   - REQ-006

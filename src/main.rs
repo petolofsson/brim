@@ -14,7 +14,9 @@ use clap::Parser;
 use claude::ClaudeProvider;
 use codex::CodexProvider;
 use copilot::CopilotProvider;
-use model::{SessionNode, SubtreeInfo, compute_subtree};
+use model::{
+    RecycleRecommendation, SessionNode, SubtreeInfo, compute_subtree, recycle_recommendation,
+};
 use opencode::OpencodeProvider;
 use parser::short_id;
 use provider::Provider;
@@ -100,6 +102,22 @@ struct JsonSubtreeInfo {
 }
 
 #[derive(Serialize)]
+struct JsonBlastRadiusEntry {
+    node_id: String,
+    active: bool,
+}
+
+/// Recycle recommendation in JSON output (ADR-009, REQ-005). Advisory only (ADR-010 §5).
+#[derive(Serialize)]
+struct JsonRecycleRecommendation {
+    target_node_id: String,
+    is_root: bool,
+    target_verdict: &'static str,
+    verdict_gate: Option<&'static str>,
+    blast_radius: Vec<JsonBlastRadiusEntry>,
+}
+
+#[derive(Serialize)]
 struct JsonOutput {
     generated_at: String,
     nodes: Vec<JsonNode>,
@@ -129,6 +147,9 @@ struct JsonNode {
     trend: Option<JsonWindowTrend>,
     /// Subtree aggregation: self + all descendants (ADR-007).
     subtree: JsonSubtreeInfo,
+    /// Recycle recommendation for this session tree (ADR-009). Null when subtree is healthy.
+    /// Set for root nodes only; null for child nodes.
+    recycle_recommendation: Option<JsonRecycleRecommendation>,
     children: Vec<JsonNode>,
 }
 
@@ -177,12 +198,30 @@ fn truncate_project(s: &str) -> String {
     }
 }
 
+fn build_json_recycle_rec(rec: &RecycleRecommendation) -> JsonRecycleRecommendation {
+    JsonRecycleRecommendation {
+        target_node_id: rec.target_node_id.clone(),
+        is_root: rec.is_root,
+        target_verdict: rec.target_verdict.as_json_str(),
+        verdict_gate: rec.verdict_gate.map(|g| g.as_json_str()),
+        blast_radius: rec
+            .blast_radius
+            .iter()
+            .map(|e| JsonBlastRadiusEntry {
+                node_id: e.node_id.clone(),
+                active: e.active,
+            })
+            .collect(),
+    }
+}
+
 fn to_json_node(
     node: &SessionNode,
     si: &SubtreeInfo,
     parent_uuid: Option<&str>,
     thresholds: &Thresholds,
     active_mins: u32,
+    rec: Option<JsonRecycleRecommendation>,
 ) -> JsonNode {
     let (
         window_tokens,
@@ -270,6 +309,7 @@ fn to_json_node(
         active: is_active(node, active_mins),
         trend,
         subtree,
+        recycle_recommendation: rec,
         children: node
             .children
             .iter()
@@ -281,6 +321,7 @@ fn to_json_node(
                     Some(&node.session_uuid),
                     thresholds,
                     active_mins,
+                    None,
                 )
             })
             .collect(),
@@ -373,7 +414,12 @@ fn main() -> Result<()> {
             generated_at: Utc::now().to_rfc3339(),
             nodes: pairs
                 .iter()
-                .map(|(si, s)| to_json_node(s, si, None, &thresholds, cli.active_mins))
+                .map(|(si, s)| {
+                    let rec =
+                        recycle_recommendation(s, &thresholds, &|n| is_active(n, cli.active_mins))
+                            .map(|r| build_json_recycle_rec(&r));
+                    to_json_node(s, si, None, &thresholds, cli.active_mins, rec)
+                })
                 .collect(),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -381,6 +427,13 @@ fn main() -> Result<()> {
     }
 
     print_subtree_summary(&pairs);
+    for (_, root) in &pairs {
+        if let Some(rec) =
+            recycle_recommendation(root, &thresholds, &|n| is_active(n, cli.active_mins))
+        {
+            print_recycle_advisory(&rec);
+        }
+    }
 
     let sessions: Vec<SessionNode> = pairs.into_iter().map(|(_, s)| s).collect();
     if cli.tree {
@@ -479,6 +532,38 @@ fn sort_children_worst_first(node: &mut SessionNode, thresholds: &Thresholds) {
             .then_with(|| sb.worst_fill_percent.cmp(&sa.worst_fill_percent))
     });
     node.children = child_pairs.into_iter().map(|(_, c)| c).collect();
+}
+
+/// Advisory recycle block (ADR-009, ADR-010 §5). Recommend, never imperative.
+fn print_recycle_advisory(rec: &RecycleRecommendation) {
+    let active_count = rec.blast_radius.iter().filter(|e| e.active).count();
+    let gate_str = rec
+        .verdict_gate
+        .map(|g| format!(" via {}", g.as_str()))
+        .unwrap_or_default();
+    println!(
+        "ADVISORY  candidate={}  verdict={}{}  blast={} desc ({} active orphans)",
+        short_id(&rec.target_node_id),
+        rec.target_verdict.as_str(),
+        gate_str,
+        rec.blast_radius.len(),
+        active_count,
+    );
+    if rec.is_root {
+        println!(
+            "          note: target is ROOT — recycling this session restarts the whole operation"
+        );
+    }
+    let active_ids: Vec<_> = rec
+        .blast_radius
+        .iter()
+        .filter(|e| e.active)
+        .map(|e| short_id(&e.node_id))
+        .collect();
+    if !active_ids.is_empty() {
+        println!("          active orphans: {}", active_ids.join(" "));
+    }
+    println!();
 }
 
 /// Top-line glanceable subtree summary across all root sessions (ADR-007).
@@ -702,7 +787,7 @@ mod tests {
         };
 
         let parent_si = compute_subtree(&parent, &thresholds);
-        let jnode = to_json_node(&parent, &parent_si, None, &thresholds, 30);
+        let jnode = to_json_node(&parent, &parent_si, None, &thresholds, 30, None);
 
         // Full untruncated ID
         assert_eq!(jnode.session_id, parent_uuid);
@@ -747,7 +832,7 @@ mod tests {
             trend: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
-        let jnode = to_json_node(&node, &node_si, None, &thresholds, 30);
+        let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
         // 190k >= ABSOLUTE_RECYCLE_BACKSTOP (128k) → Over via abs-backstop gate (ADR-010)
         assert_eq!(jnode.verdict, Some("over_recycle"));
         assert_eq!(jnode.verdict_gate, Some("absolute_backstop"));
@@ -844,7 +929,7 @@ mod tests {
             trend: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
-        let jnode = to_json_node(&node, &node_si, None, &thresholds, 30);
+        let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
         assert_eq!(jnode.model, None);
         assert_eq!(jnode.context_limit, None);
         assert_eq!(jnode.window_tokens, None);
@@ -1276,7 +1361,7 @@ mod tests {
             }),
         };
         let node_si = compute_subtree(&node, &thresholds);
-        let jnode = to_json_node(&node, &node_si, None, &thresholds, 30);
+        let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
         let t = jnode.trend.as_ref().expect("trend in json node");
         assert_eq!(t.velocity_tokens_per_turn, Some(10_000));
         assert_eq!(t.projected_turns_to_overbound, Some(10));
