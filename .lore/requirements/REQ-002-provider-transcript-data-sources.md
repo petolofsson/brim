@@ -17,7 +17,7 @@ related_tests:
 ## Requirement
 
 * The system shall discover Claude Code transcripts under `~/.claude/projects/<encoded-cwd>/`, treating `<UUID>.jsonl` as sessions and `<UUID>/subagents/agent-*.jsonl` as sub-agents.
-* The system shall support Codex (`~/.codex`) and Copilot (`~/.copilot`) sessions as flat data sources.
+* The system shall support Codex (`~/.codex`) and Copilot (`~/.copilot`) sessions. brim treats these as flat (no sub-agent tree) by deliberate scope cut, not data limitation: Codex sub-agents ARE separate rollout files linkable via `SessionMeta` `parent_thread_id` / `forked_from_id` / `agent_role`, but brim does not reconstruct that linkage in this increment.
 * The system shall mark a provider unavailable (not error) when its data directory is absent.
 * The system shall skip malformed or partial transcript lines without panicking.
 * The system shall use only real token counters present in the transcript; no estimation.
