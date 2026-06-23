@@ -1,7 +1,7 @@
 ---
 id: ADR-010
 title: "Recycle threshold: absolute effective-budget over advertised-window ratio"
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-004
   - REQ-007

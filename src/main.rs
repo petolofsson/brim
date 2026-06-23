@@ -19,7 +19,7 @@ use opencode::OpencodeProvider;
 use parser::short_id;
 use provider::Provider;
 use serde::Serialize;
-use verdict::Thresholds;
+use verdict::{Thresholds, Verdict, absolute_verdict};
 
 const PROJECT_COL_WIDTH: usize = 28;
 
@@ -48,6 +48,14 @@ struct Cli {
     /// Fill % at which verdict becomes 'over -> recycle' (default: 90)
     #[arg(long, default_value_t = 90)]
     ceiling: u8,
+
+    /// Absolute active-token watch band; research-anchored per ADR-010 (default: 32000)
+    #[arg(long, default_value_t = 32_000)]
+    watch_tokens: u64,
+
+    /// Absolute recycle backstop; research-anchored per ADR-010 (default: 128000)
+    #[arg(long, default_value_t = 128_000)]
+    recycle_backstop: u64,
 
     /// Emit structured JSON to stdout instead of human-readable text (REQ-005)
     #[arg(long)]
@@ -93,7 +101,12 @@ struct JsonNode {
     context_limit: Option<u64>,
     window_tokens: Option<u64>,
     fill_percent: Option<u8>,
+    /// Quality verdict: OR of ADR-010 absolute-budget, projection, and cache-thrash signals.
     verdict: Option<&'static str>,
+    /// Which ADR-010 OR-gate fired (null when verdict is ok).
+    verdict_gate: Option<&'static str>,
+    /// Capacity runway: fill % mapped to distance from auto-compaction (ADR-010 §2).
+    capacity_runway: Option<&'static str>,
     /// Provenance of the reported window occupancy: "last_turn" or "aggregate" (REQ-005).
     window_source: Option<&'static str>,
     last_turn_at: Option<String>,
@@ -154,20 +167,40 @@ fn to_json_node(
     thresholds: &Thresholds,
     active_mins: u32,
 ) -> JsonNode {
-    let (window_tokens, fill_percent, model, context_limit, verdict, window_source) = node
-        .window
-        .as_ref()
-        .map(|w| {
-            (
-                Some(w.window_tokens),
-                Some(w.fill_percent),
-                Some(w.model.clone()),
-                Some(w.context_limit),
-                Some(thresholds.verdict(w.fill_percent).as_json_str()),
-                Some(w.window_source.as_json_str()),
-            )
-        })
-        .unwrap_or((None, None, None, None, None, None));
+    let (
+        window_tokens,
+        fill_percent,
+        model,
+        context_limit,
+        verdict,
+        verdict_gate,
+        capacity_runway,
+        window_source,
+    ) = if let Some(w) = node.window.as_ref() {
+        let projected_turns = node
+            .trend
+            .as_ref()
+            .and_then(|t| t.projected_turns_to_overbound);
+        let (v, gate) = absolute_verdict(
+            w.window_tokens,
+            projected_turns,
+            w.cache_hit_ratio,
+            thresholds.watch_tokens,
+            thresholds.recycle_backstop,
+        );
+        (
+            Some(w.window_tokens),
+            Some(w.fill_percent),
+            Some(w.model.clone()),
+            Some(w.context_limit),
+            Some(v.as_json_str()),
+            gate.map(|g| g.as_json_str()),
+            Some(thresholds.runway_capacity_str(w.fill_percent)),
+            Some(w.window_source.as_json_str()),
+        )
+    } else {
+        (None, None, None, None, None, None, None, None)
+    };
 
     // For sub-agents: session_id = agent_id (the sub-agent's own UUID).
     // For roots: session_id = session_uuid.
@@ -202,6 +235,8 @@ fn to_json_node(
         window_tokens,
         fill_percent,
         verdict,
+        verdict_gate,
+        capacity_runway,
         window_source,
         last_turn_at: node.last_turn_at.map(|ts| ts.to_rfc3339()),
         active: is_active(node, active_mins),
@@ -222,9 +257,17 @@ fn main() -> Result<()> {
         cli.nearing,
         cli.ceiling,
     );
+    anyhow::ensure!(
+        cli.watch_tokens <= cli.recycle_backstop,
+        "--watch-tokens ({}) must be \u{2264} --recycle-backstop ({})",
+        cli.watch_tokens,
+        cli.recycle_backstop,
+    );
     let thresholds = Thresholds {
         nearing: cli.nearing,
         ceiling: cli.ceiling,
+        watch_tokens: cli.watch_tokens,
+        recycle_backstop: cli.recycle_backstop,
     };
 
     let providers: Vec<Box<dyn Provider>> = vec![
@@ -290,18 +333,38 @@ fn tokens_str(node: &SessionNode) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn fill_str(node: &SessionNode) -> String {
-    node.window
-        .as_ref()
-        .map(|w| format!("{}%", w.fill_percent))
-        .unwrap_or_else(|| "-".to_string())
+/// Capacity-runway readout column. Suffix '~' = nearing auto-compaction, '!' = at/over.
+fn fill_str(node: &SessionNode, thresholds: &Thresholds) -> String {
+    let Some(w) = node.window.as_ref() else {
+        return "-".to_string();
+    };
+    let suffix = match thresholds.runway(w.fill_percent) {
+        Verdict::Over => "!",
+        Verdict::Nearing => "~",
+        Verdict::Ok => "",
+    };
+    format!("{}%{}", w.fill_percent, suffix)
 }
 
-fn verdict_str<'a>(node: &SessionNode, thresholds: &'a Thresholds) -> &'a str {
-    node.window
+fn verdict_str(node: &SessionNode, thresholds: &Thresholds) -> String {
+    let Some(w) = node.window.as_ref() else {
+        return "-".to_string();
+    };
+    let projected_turns = node
+        .trend
         .as_ref()
-        .map(|w| thresholds.verdict(w.fill_percent).as_str())
-        .unwrap_or("-")
+        .and_then(|t| t.projected_turns_to_overbound);
+    let (v, gate) = absolute_verdict(
+        w.window_tokens,
+        projected_turns,
+        w.cache_hit_ratio,
+        thresholds.watch_tokens,
+        thresholds.recycle_backstop,
+    );
+    match gate {
+        Some(g) => format!("{} ({})", v.as_str(), g.as_str()),
+        None => v.as_str().to_string(),
+    }
 }
 
 fn model_str(node: &SessionNode) -> &str {
@@ -327,8 +390,8 @@ fn project_str(node: &SessionNode) -> &str {
 
 fn print_flat(sessions: &[SessionNode], thresholds: &Thresholds) {
     println!(
-        "{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} MODEL",
-        "SESSION", "TOKENS", "FILL", "VERDICT", "AGE", "PROJECT"
+        "{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} MODEL",
+        "SESSION", "TOKENS", "FILL%", "VERDICT", "AGE", "PROJECT"
     );
     for s in sessions {
         let id = short_id(&s.session_uuid);
@@ -338,10 +401,10 @@ fn print_flat(sessions: &[SessionNode], thresholds: &Thresholds) {
             format!("  [{} sub-agent(s)]", s.children.len())
         };
         println!(
-            "{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} {}{}",
+            "{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} {}{}",
             id,
             tokens_str(s),
-            fill_str(s),
+            fill_str(s, thresholds),
             verdict_str(s, thresholds),
             age_str(s.last_turn_at),
             truncate_project(project_str(s)),
@@ -354,10 +417,10 @@ fn print_flat(sessions: &[SessionNode], thresholds: &Thresholds) {
 fn print_tree(sessions: &[SessionNode], thresholds: &Thresholds) {
     for s in sessions {
         println!(
-            "{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} {}",
+            "{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} {}",
             short_id(&s.session_uuid),
             tokens_str(s),
-            fill_str(s),
+            fill_str(s, thresholds),
             verdict_str(s, thresholds),
             age_str(s.last_turn_at),
             truncate_project(project_str(s)),
@@ -372,11 +435,11 @@ fn print_tree(sessions: &[SessionNode], thresholds: &Thresholds) {
                 .map(short_id)
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {} agent:{:<16} {:>8}  {:>5}  {:<18}  {:<5}  {:<28} {}",
+                "  {} agent:{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} {}",
                 conn,
                 child_id,
                 tokens_str(child),
-                fill_str(child),
+                fill_str(child, thresholds),
                 verdict_str(child, thresholds),
                 age_str(child.last_turn_at),
                 "",
@@ -473,8 +536,9 @@ mod tests {
             agent_id: None,
             project_key: "test-project".to_string(),
             window: Some(WindowInfo {
-                window_tokens: 142_000,
-                fill_percent: 71,
+                // 40k: above ABSOLUTE_WATCH_TOKENS (32k), below ABSOLUTE_RECYCLE_BACKSTOP (128k)
+                window_tokens: 40_000,
+                fill_percent: 20,
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
@@ -491,8 +555,10 @@ mod tests {
         assert_eq!(jnode.session_id, parent_uuid);
         assert_eq!(jnode.parent_session_id, None);
         assert_eq!(jnode.agent_id, None);
-        assert_eq!(jnode.fill_percent, Some(71));
+        assert_eq!(jnode.fill_percent, Some(20));
+        // 40k >= ABSOLUTE_WATCH_TOKENS → Nearing via abs-watch gate (ADR-010)
         assert_eq!(jnode.verdict, Some("nearing"));
+        assert_eq!(jnode.verdict_gate, Some("absolute_watch"));
         assert!(jnode.fill_percent <= Some(100));
         assert_eq!(jnode.children.len(), 1);
 
@@ -528,7 +594,9 @@ mod tests {
             trend: None,
         };
         let jnode = to_json_node(&node, None, &thresholds, 30);
+        // 190k >= ABSOLUTE_RECYCLE_BACKSTOP (128k) → Over via abs-backstop gate (ADR-010)
         assert_eq!(jnode.verdict, Some("over_recycle"));
+        assert_eq!(jnode.verdict_gate, Some("absolute_backstop"));
     }
 
     #[test]

@@ -620,7 +620,7 @@ mod tests {
     // Dedupe: consecutive events with identical total_token_usage are collapsed.
     // No zero-delta TimelinePoint should appear in the trend.
     // Cumulative: 10k, 10k (dup), 20k, 20k (dup), 35k
-    // After dedup: 10k, 20k, 35k → deltas: 10k, 15k → velocity = 12.5k → upper-median = 15k
+    // After dedup: 10k, 20k, 35k → per-turn window sizes: 10k, 15k → delta: 5k → velocity = 5k
     #[test]
     fn test_codex_trend_dedupe_no_zero_point() {
         let line1 = make_token_count_line(10_000, 0, 0, "2024-06-01T10:00:00Z");
