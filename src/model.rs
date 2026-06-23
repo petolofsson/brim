@@ -25,6 +25,25 @@ pub struct WindowInfo {
     pub model: String,
     pub context_limit: u64,
     pub window_source: WindowSource,
+    /// cache_read / window_tokens, bounded [0,1]. None when no cache split (ADR-008).
+    pub cache_hit_ratio: Option<f32>,
+}
+
+/// One point in a session's fill trajectory (ADR-006, REQ-007).
+#[derive(Debug, Clone)]
+pub struct TimelinePoint {
+    pub at: DateTime<Utc>,
+    pub window_tokens: u64,
+    pub fill_percent: u8,
+    pub cache_hit_ratio: Option<f32>,
+}
+
+/// Growth trend derived from a bounded tail read of the last K assistant turns (ADR-006).
+#[derive(Debug, Clone)]
+pub struct WindowTrend {
+    pub points: Vec<TimelinePoint>,
+    pub velocity_tokens_per_turn: Option<u64>,
+    pub projected_turns_to_overbound: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,4 +58,6 @@ pub struct SessionNode {
     pub children: Vec<SessionNode>,
     /// Timestamp of the latest assistant turn used for the window computation.
     pub last_turn_at: Option<DateTime<Utc>>,
+    /// Velocity/projection trend from the last K turns (ADR-006). None if unavailable.
+    pub trend: Option<WindowTrend>,
 }

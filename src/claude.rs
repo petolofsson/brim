@@ -1,8 +1,8 @@
 use crate::{
-    model::{SessionNode, WindowInfo, WindowSource},
+    model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
-    window::compute_window_info,
+    window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -43,14 +43,30 @@ impl Provider for ClaudeProvider {
     }
 }
 
-/// Scan the tail of a JSONL transcript and return the last-turn WindowInfo and its timestamp.
-fn parse_last_turn(path: &Path) -> (Option<WindowInfo>, Option<DateTime<Utc>>) {
+struct TurnData {
+    input: u64,
+    cache_read: u64,
+    cache_create: u64,
+    model: String,
+    ts: Option<DateTime<Utc>>,
+}
+
+/// Scan the tail of a JSONL transcript, collect the last TREND_TAIL_K assistant turns,
+/// and return the last-turn WindowInfo, its timestamp, and the velocity trend.
+fn parse_transcript(
+    path: &Path,
+) -> (
+    Option<WindowInfo>,
+    Option<DateTime<Utc>>,
+    Option<WindowTrend>,
+) {
     let text = match read_tail(path) {
         Ok(t) => t,
-        Err(_) => return (None, None),
+        Err(_) => return (None, None, None),
     };
-    let mut result: Option<WindowInfo> = None;
-    let mut last_ts: Option<DateTime<Utc>> = None;
+
+    // Collect all valid (non-zero-usage) assistant turns from the tail.
+    let mut turns: Vec<TurnData> = Vec::new();
 
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -63,7 +79,6 @@ fn parse_last_turn(path: &Path) -> (Option<WindowInfo>, Option<DateTime<Utc>>) {
             continue;
         }
 
-        // Parse timestamp locally; only bind to last_ts on the window turn (B1).
         let ts_opt = obj
             .get("timestamp")
             .and_then(|v| v.as_str())
@@ -93,24 +108,72 @@ fn parse_last_turn(path: &Path) -> (Option<WindowInfo>, Option<DateTime<Utc>>) {
             continue;
         }
 
-        if let Some(ts) = ts_opt {
-            last_ts = Some(ts);
-        }
         let model = msg
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        result = Some(compute_window_info(
+        turns.push(TurnData {
             input,
             cache_read,
             cache_create,
-            &model,
-            WindowSource::LastTurn,
-        ));
+            model,
+            ts: ts_opt,
+        });
     }
 
-    (result, last_ts)
+    // Bound to last K turns (tail read — never keep unbounded growth).
+    if turns.len() > TREND_TAIL_K {
+        turns.drain(0..turns.len() - TREND_TAIL_K);
+    }
+
+    if turns.is_empty() {
+        return (None, None, None);
+    }
+
+    // Last valid turn → WindowInfo. Timestamp bound to this turn only (B1).
+    let Some(last) = turns.last() else {
+        return (None, None, None);
+    };
+    let window_info = compute_window_info(
+        last.input,
+        last.cache_read,
+        last.cache_create,
+        &last.model,
+        WindowSource::LastTurn,
+    );
+    let last_ts = last.ts;
+    let last_model = last.model.clone();
+    let limit = window_info.context_limit;
+
+    // Build timeline points for turns that carry a timestamp.
+    let timeline_points: Vec<TimelinePoint> = turns
+        .iter()
+        .filter_map(|t| {
+            let at = t.ts?;
+            let info = compute_window_info(
+                t.input,
+                t.cache_read,
+                t.cache_create,
+                &last_model,
+                WindowSource::LastTurn,
+            );
+            Some(TimelinePoint {
+                at,
+                window_tokens: info.window_tokens,
+                fill_percent: info.fill_percent,
+                cache_hit_ratio: info.cache_hit_ratio,
+            })
+        })
+        .collect();
+
+    let trend = if !timeline_points.is_empty() {
+        Some(compute_trend(timeline_points, limit))
+    } else {
+        None
+    };
+
+    (Some(window_info), last_ts, trend)
 }
 
 fn agent_id_from_stem(stem: &str) -> Option<String> {
@@ -146,7 +209,7 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
             }
             file_count += 1;
             let uuid = name.trim_end_matches(".jsonl").to_string();
-            let (window, last_turn_at) = parse_last_turn(&path);
+            let (window, last_turn_at, trend) = parse_transcript(&path);
             parents.push(SessionNode {
                 session_uuid: uuid,
                 agent_id: None,
@@ -154,6 +217,7 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
                 window,
                 children: Vec::new(),
                 last_turn_at,
+                trend,
             });
         } else if path.is_dir() {
             let parent_uuid = name.clone();
@@ -178,7 +242,7 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
                     continue;
                 }
                 let agent_id = agent_id_from_stem(sub_stem);
-                let (window, last_turn_at) = parse_last_turn(&sub_path);
+                let (window, last_turn_at, trend) = parse_transcript(&sub_path);
                 children.push(SessionNode {
                     session_uuid: parent_uuid.clone(),
                     agent_id,
@@ -186,6 +250,7 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
                     window,
                     children: Vec::new(),
                     last_turn_at,
+                    trend,
                 });
             }
             child_map.insert(parent_uuid, children);
@@ -495,6 +560,50 @@ mod tests {
         // Must be 10:00 (the window turn), not 11:00 (zero-usage turn)
         let ts = sessions[0].last_turn_at.unwrap();
         assert_eq!(ts.to_rfc3339(), "2026-06-23T10:00:00+00:00");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // Trend: two turns with timestamps → trend has 2 points; velocity computed.
+    #[test]
+    fn test_trend_built_from_multiple_turns() {
+        let tmp = std::env::temp_dir().join("brim_test_trend");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let uuid = "cccccccc-dddd-eeee-ffff-000011112222";
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-23T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-23T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":70000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+        let sessions = discover_project(&tmp);
+        assert_eq!(sessions.len(), 1);
+        let trend = sessions[0].trend.as_ref().expect("trend present");
+        assert_eq!(trend.points.len(), 2);
+        // velocity = 70k - 50k = 20k; projection = (200k-70k)/20k = 6
+        assert_eq!(trend.velocity_tokens_per_turn, Some(20_000));
+        assert_eq!(trend.projected_turns_to_overbound, Some(6));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // Trend: turns without timestamps are excluded from timeline points.
+    #[test]
+    fn test_trend_excludes_turns_without_timestamps() {
+        let tmp = std::env::temp_dir().join("brim_test_trend_no_ts");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let uuid = "33334444-5555-6666-7777-888899990000";
+        // Two turns but neither has a timestamp → no timeline points → trend = None
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":70000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+        let sessions = discover_project(&tmp);
+        assert_eq!(sessions.len(), 1);
+        // Window is still computed (last valid turn)
+        assert!(sessions[0].window.is_some());
+        // But trend is None (no timestamps → no timeline points)
+        assert!(sessions[0].trend.is_none());
         let _ = fs::remove_dir_all(&tmp);
     }
 }

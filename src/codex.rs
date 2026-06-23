@@ -14,10 +14,10 @@
 //! per REQ-002 / REQ-003 / FEATURE-001.
 
 use crate::{
-    model::{SessionNode, WindowInfo, WindowSource},
+    model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
-    window::compute_window_info,
+    window::{TREND_TAIL_K, compute_trend, compute_window_info, window_limit},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -93,7 +93,7 @@ fn parse_session_file(path: &Path) -> Option<SessionNode> {
     let session_id = extract_session_id(path, &tail);
     let model = extract_model(&tail);
     let project_key = extract_project_key(&tail);
-    let (window, last_turn_at) = extract_window(&tail, &model);
+    let (window, last_turn_at, trend) = extract_window(&tail, &model);
     Some(SessionNode {
         session_uuid: session_id,
         agent_id: None,
@@ -101,6 +101,7 @@ fn parse_session_file(path: &Path) -> Option<SessionNode> {
         window,
         children: Vec::new(),
         last_turn_at,
+        trend,
     })
 }
 
@@ -194,7 +195,7 @@ fn extract_project_key(tail: &str) -> String {
 }
 
 /// Token counts parsed from a `total_token_usage` object.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 struct TokenCounts {
     /// Total input including cached hits (Codex JSONL semantics).
     input_tokens: u64,
@@ -224,12 +225,22 @@ fn parse_token_counts(v: &Value) -> TokenCounts {
     }
 }
 
-/// Extract last-turn window from the tail's `token_count` events.
+/// Extract last-turn window, timestamp, and velocity trend from the tail's `token_count` events.
 ///
-/// With ≥2 events: delta of last two → `WindowSource::LastTurn`.
-/// With exactly 1: absolute values → `WindowSource::Aggregate`.
-/// With 0: `(None, None)`.
-fn extract_window(tail: &str, model: &str) -> (Option<WindowInfo>, Option<DateTime<Utc>>) {
+/// Consecutive events with identical `total_token_usage` are collapsed before any delta
+/// (dedupe for OpenAI codex #14489 rate-limit re-emits).
+///
+/// With ≥2 deduped events: delta of last two → `WindowSource::LastTurn`; trend from last K+1 deltas.
+/// With exactly 1: absolute values → `WindowSource::Aggregate`; trend = None.
+/// With 0: `(None, None, None)`.
+fn extract_window(
+    tail: &str,
+    model: &str,
+) -> (
+    Option<WindowInfo>,
+    Option<DateTime<Utc>>,
+    Option<WindowTrend>,
+) {
     let mut events: Vec<(TokenCounts, Option<DateTime<Utc>>)> = Vec::new();
     for line in tail.lines() {
         let line = line.trim();
@@ -252,34 +263,45 @@ fn extract_window(tail: &str, model: &str) -> (Option<WindowInfo>, Option<DateTi
     }
 
     if events.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
 
-    let (counts, ts, source) = if events.len() >= 2 {
-        let (last, last_ts) = events.last().unwrap();
-        let (prev, _) = &events[events.len() - 2];
+    // Dedupe: collapse consecutive events with identical total_token_usage (OpenAI codex #14489).
+    let mut deduped: Vec<(TokenCounts, Option<DateTime<Utc>>)> = Vec::new();
+    for ev in events {
+        if deduped.last().is_some_and(|prev| prev.0 == ev.0) {
+            continue;
+        }
+        deduped.push(ev);
+    }
+
+    // Last-turn window: delta of the last two deduped events.
+    let (counts, ts, source) = if deduped.len() >= 2 {
+        let last = &deduped[deduped.len() - 1];
+        let prev = &deduped[deduped.len() - 2];
         let delta = TokenCounts {
-            input_tokens: last.input_tokens.saturating_sub(prev.input_tokens),
+            input_tokens: last.0.input_tokens.saturating_sub(prev.0.input_tokens),
             cached_input_tokens: last
+                .0
                 .cached_input_tokens
-                .saturating_sub(prev.cached_input_tokens),
+                .saturating_sub(prev.0.cached_input_tokens),
             cache_creation_input_tokens: last
+                .0
                 .cache_creation_input_tokens
-                .saturating_sub(prev.cache_creation_input_tokens),
+                .saturating_sub(prev.0.cache_creation_input_tokens),
         };
-        if delta.all_zero() && !last.all_zero() {
-            // Stalled turn: delta is zero but session is live; degrade to absolute.
-            (last.clone(), *last_ts, WindowSource::Aggregate)
+        if delta.all_zero() && !last.0.all_zero() {
+            (last.0.clone(), last.1, WindowSource::Aggregate)
         } else {
-            (delta, *last_ts, WindowSource::LastTurn)
+            (delta, last.1, WindowSource::LastTurn)
         }
     } else {
-        let (counts, ts) = &events[0];
+        let (counts, ts) = &deduped[0];
         (counts.clone(), *ts, WindowSource::Aggregate)
     };
 
     if counts.all_zero() {
-        return (None, ts);
+        return (None, ts, None);
     }
 
     // `input_tokens` includes cached hits; subtract to get pure uncached input.
@@ -296,7 +318,56 @@ fn extract_window(tail: &str, model: &str) -> (Option<WindowInfo>, Option<DateTi
         model,
         source,
     );
-    (Some(info), ts)
+
+    // Trend: last K+1 deduped events → K per-turn occupancy deltas → TimelinePoints (ADR-006).
+    // Each point's window_tokens = delta of consecutive cumulative totals = per-turn context size.
+    // All points are deltas; the first event is baseline only.
+    let trend = {
+        let start = deduped.len().saturating_sub(TREND_TAIL_K + 1);
+        let tail_events = &deduped[start..];
+        if tail_events.len() >= 2 {
+            let limit = window_limit(model);
+            let mut points: Vec<TimelinePoint> = Vec::new();
+            for i in 1..tail_events.len() {
+                let prev = &tail_events[i - 1];
+                let curr = &tail_events[i];
+                let Some(at) = curr.1 else { continue };
+                let d_in = curr.0.input_tokens.saturating_sub(prev.0.input_tokens);
+                let d_cached = curr
+                    .0
+                    .cached_input_tokens
+                    .saturating_sub(prev.0.cached_input_tokens);
+                let d_create = curr
+                    .0
+                    .cache_creation_input_tokens
+                    .saturating_sub(prev.0.cache_creation_input_tokens);
+                // After dedup, identical events are collapsed; zero delta shouldn't occur.
+                // Guard anyway to avoid injecting zero-window-tokens points.
+                let all_zero = d_in == 0 && d_cached == 0 && d_create == 0;
+                if all_zero {
+                    continue;
+                }
+                let pure = d_in.saturating_sub(d_cached);
+                let pt_info =
+                    compute_window_info(pure, d_cached, d_create, model, WindowSource::LastTurn);
+                points.push(TimelinePoint {
+                    at,
+                    window_tokens: pt_info.window_tokens,
+                    fill_percent: pt_info.fill_percent,
+                    cache_hit_ratio: pt_info.cache_hit_ratio,
+                });
+            }
+            if points.len() >= 2 {
+                Some(compute_trend(points, limit))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    (Some(info), ts, trend)
 }
 
 fn parse_timestamp(v: &Value) -> Option<DateTime<Utc>> {
@@ -357,9 +428,8 @@ mod tests {
         let line2 = make_token_count_line(120_000, 80_000, 10_000, "2024-06-01T10:01:00Z");
         let tail = format!("{line1}\n{line2}\n");
 
-        let (window, ts) = extract_window(&tail, "codex");
+        let (window, ts, _trend) = extract_window(&tail, "codex");
         let w = window.expect("window present");
-        // pure_input = 120000-80000 - (100000-80000) = 40000 - 20000 = 20000? no...
         // delta.input_tokens = 120000-100000=20000, delta.cached=0, delta.cache_create=0
         // pure_input = 20000 - 0 = 20000
         // window_tokens = 20000 + 0 + 0 = 20000
@@ -376,7 +446,7 @@ mod tests {
     #[test]
     fn test_codex_single_event_aggregate() {
         let line = make_token_count_line(50_000, 30_000, 5_000, "2024-06-01T10:00:00Z");
-        let (window, _) = extract_window(&line, "codex");
+        let (window, _, _trend) = extract_window(&line, "codex");
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 55_000);
         assert_eq!(w.fill_percent, 28);
@@ -388,7 +458,7 @@ mod tests {
     fn test_codex_malformed_line_skipped() {
         let good = make_token_count_line(40_000, 0, 0, "2024-06-01T10:00:00Z");
         let tail = format!("{{not valid json\n{good}\n");
-        let (window, _) = extract_window(&tail, "codex");
+        let (window, _, _trend) = extract_window(&tail, "codex");
         // malformed line silently skipped; good line parsed → Aggregate (1 event)
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 40_000);
@@ -494,9 +564,112 @@ mod tests {
         let line3 = make_token_count_line(6_000, 0, 0, "2024-06-01T10:02:00Z");
         let tail = format!("{line1}\n{line2}\n{line3}\n");
 
-        let (window, _) = extract_window(&tail, "codex");
+        let (window, _, _trend) = extract_window(&tail, "codex");
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 1_000);
         assert_eq!(w.window_source, WindowSource::LastTurn);
+    }
+
+    // ADR-006: Codex trend is computed from per-turn occupancy deltas.
+    // Rising cumulative totals → rising deltas → velocity present.
+    // Cumulative: 10k, 20k, 35k, 55k → deltas: 10k, 15k, 20k
+    // compute_trend on [10k, 15k, 20k]: pos deltas = [5k, 5k] → velocity = 5k
+    // projection = (200k - 20k) / 5k = 36
+    #[test]
+    fn test_codex_trend_rising_occupancy() {
+        let line1 = make_token_count_line(10_000, 0, 0, "2024-06-01T10:00:00Z");
+        let line2 = make_token_count_line(20_000, 0, 0, "2024-06-01T10:01:00Z");
+        let line3 = make_token_count_line(35_000, 0, 0, "2024-06-01T10:02:00Z");
+        let line4 = make_token_count_line(55_000, 0, 0, "2024-06-01T10:03:00Z");
+        let tail = format!("{line1}\n{line2}\n{line3}\n{line4}\n");
+
+        let (_, _, trend) = extract_window(&tail, "codex");
+        let t = trend.expect("trend must be present");
+        assert!(
+            t.velocity_tokens_per_turn.is_some(),
+            "velocity present for rising occupancy"
+        );
+        assert_eq!(t.velocity_tokens_per_turn, Some(5_000));
+        assert_eq!(t.projected_turns_to_overbound, Some(36));
+        assert_eq!(t.points.len(), 3);
+    }
+
+    // Compaction (reset): a delta smaller than the previous signals context shrink.
+    // Cumulative: 10k, 30k, 42k, 50k, 60k
+    // Deltas: 20k, 12k (drop → reset boundary), 8k, 10k
+    // compute_trend on [20k, 12k, 8k, 10k]: reset at idx 1 (12k < 20k), then again at idx 2 (8k < 12k)
+    // post_reset_start = 2, post_reset = [8k, 10k] → pos delta = [2k] → velocity = 2k
+    #[test]
+    fn test_codex_trend_reset_detection() {
+        let line1 = make_token_count_line(10_000, 0, 0, "2024-06-01T10:00:00Z");
+        let line2 = make_token_count_line(30_000, 0, 0, "2024-06-01T10:01:00Z");
+        let line3 = make_token_count_line(42_000, 0, 0, "2024-06-01T10:02:00Z");
+        let line4 = make_token_count_line(50_000, 0, 0, "2024-06-01T10:03:00Z");
+        let line5 = make_token_count_line(60_000, 0, 0, "2024-06-01T10:04:00Z");
+        let tail = format!("{line1}\n{line2}\n{line3}\n{line4}\n{line5}\n");
+
+        let (_, _, trend) = extract_window(&tail, "codex");
+        let t = trend.expect("trend present");
+        assert!(
+            t.velocity_tokens_per_turn.is_some(),
+            "velocity present post-reset"
+        );
+        assert_eq!(t.velocity_tokens_per_turn, Some(2_000));
+    }
+
+    // Dedupe: consecutive events with identical total_token_usage are collapsed.
+    // No zero-delta TimelinePoint should appear in the trend.
+    // Cumulative: 10k, 10k (dup), 20k, 20k (dup), 35k
+    // After dedup: 10k, 20k, 35k → deltas: 10k, 15k → velocity = 12.5k → upper-median = 15k
+    #[test]
+    fn test_codex_trend_dedupe_no_zero_point() {
+        let line1 = make_token_count_line(10_000, 0, 0, "2024-06-01T10:00:00Z");
+        let line2 = make_token_count_line(10_000, 0, 0, "2024-06-01T10:00:30Z"); // dup
+        let line3 = make_token_count_line(20_000, 0, 0, "2024-06-01T10:01:00Z");
+        let line4 = make_token_count_line(20_000, 0, 0, "2024-06-01T10:01:30Z"); // dup
+        let line5 = make_token_count_line(35_000, 0, 0, "2024-06-01T10:02:00Z");
+        let tail = format!("{line1}\n{line2}\n{line3}\n{line4}\n{line5}\n");
+
+        let (_, _, trend) = extract_window(&tail, "codex");
+        let t = trend.expect("trend present");
+        for pt in &t.points {
+            assert!(
+                pt.window_tokens > 0,
+                "no zero-window-tokens point after dedup"
+            );
+        }
+        assert!(t.velocity_tokens_per_turn.is_some());
+    }
+
+    // Dedupe: trailing duplicate must NOT zero the last-turn window.
+    // Events: 10k, 20k, 20k (trailing dup)
+    // After dedup: 10k, 20k → delta = 10k → window_tokens = 10k (not 0)
+    #[test]
+    fn test_codex_dedupe_trailing_dup_does_not_zero_window() {
+        let line1 = make_token_count_line(10_000, 0, 0, "2024-06-01T10:00:00Z");
+        let line2 = make_token_count_line(20_000, 0, 0, "2024-06-01T10:01:00Z");
+        let line3 = make_token_count_line(20_000, 0, 0, "2024-06-01T10:01:30Z"); // trailing dup
+        let tail = format!("{line1}\n{line2}\n{line3}\n");
+
+        let (window, _, _) = extract_window(&tail, "codex");
+        let w = window.expect("window present");
+        assert_eq!(w.window_tokens, 10_000, "trailing dup must not zero window");
+        assert_eq!(w.window_source, WindowSource::LastTurn);
+    }
+
+    // window_tokens formula: input + cache_create (pure_input + cached + cache_create = input + cache_create).
+    #[test]
+    fn test_window_tokens_formula() {
+        let c = TokenCounts {
+            input_tokens: 100,
+            cached_input_tokens: 60,
+            cache_creation_input_tokens: 20,
+        };
+        // pure_input = 100-60=40; window = 40 + 60 + 20 = 120 = input(100) + cache_create(20)
+        let pure_input = c.input_tokens.saturating_sub(c.cached_input_tokens);
+        let wt = pure_input
+            .saturating_add(c.cached_input_tokens)
+            .saturating_add(c.cache_creation_input_tokens);
+        assert_eq!(wt, 120);
     }
 }

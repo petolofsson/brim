@@ -63,6 +63,21 @@ struct Cli {
 }
 
 #[derive(Serialize)]
+struct JsonTimelinePoint {
+    at: String,
+    window_tokens: u64,
+    fill_percent: u8,
+    cache_hit_ratio: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct JsonWindowTrend {
+    points: Vec<JsonTimelinePoint>,
+    velocity_tokens_per_turn: Option<u64>,
+    projected_turns_to_overbound: Option<u32>,
+}
+
+#[derive(Serialize)]
 struct JsonOutput {
     generated_at: String,
     nodes: Vec<JsonNode>,
@@ -83,6 +98,8 @@ struct JsonNode {
     window_source: Option<&'static str>,
     last_turn_at: Option<String>,
     active: bool,
+    /// Per-turn fill trajectory: velocity, projection, cache-hit ratio (ADR-006, ADR-008).
+    trend: Option<JsonWindowTrend>,
     children: Vec<JsonNode>,
 }
 
@@ -160,6 +177,21 @@ fn to_json_node(
         .unwrap_or(&node.session_uuid)
         .to_string();
 
+    let trend = node.trend.as_ref().map(|t| JsonWindowTrend {
+        points: t
+            .points
+            .iter()
+            .map(|p| JsonTimelinePoint {
+                at: p.at.to_rfc3339(),
+                window_tokens: p.window_tokens,
+                fill_percent: p.fill_percent,
+                cache_hit_ratio: p.cache_hit_ratio,
+            })
+            .collect(),
+        velocity_tokens_per_turn: t.velocity_tokens_per_turn,
+        projected_turns_to_overbound: t.projected_turns_to_overbound,
+    });
+
     JsonNode {
         session_id,
         parent_session_id: parent_uuid.map(|s| s.to_string()),
@@ -173,6 +205,7 @@ fn to_json_node(
         window_source,
         last_turn_at: node.last_turn_at.map(|ts| ts.to_rfc3339()),
         active: is_active(node, active_mins),
+        trend,
         children: node
             .children
             .iter()
@@ -369,9 +402,11 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
             }),
             children: Vec::new(),
             last_turn_at,
+            trend: None,
         }
     }
 
@@ -426,9 +461,11 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
             }),
             children: Vec::new(),
             last_turn_at: None,
+            trend: None,
         };
 
         let parent = SessionNode {
@@ -441,9 +478,11 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
             }),
             children: vec![child],
             last_turn_at: None,
+            trend: None,
         };
 
         let jnode = to_json_node(&parent, None, &thresholds, 30);
@@ -482,9 +521,11 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
             }),
             children: Vec::new(),
             last_turn_at: None,
+            trend: None,
         };
         let jnode = to_json_node(&node, None, &thresholds, 30);
         assert_eq!(jnode.verdict, Some("over_recycle"));
@@ -518,9 +559,11 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
             }),
             children: Vec::new(),
             last_turn_at: Some(Utc::now() - chrono::Duration::minutes(5)),
+            trend: None,
         };
         let parent = SessionNode {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
@@ -532,9 +575,11 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
             }),
             children: vec![child],
             last_turn_at: Some(Utc::now() - chrono::Duration::hours(2)),
+            trend: None,
         };
         let mut sessions = vec![parent];
         sessions.retain(|s| any_active(s, 30));
@@ -574,6 +619,7 @@ mod tests {
             window: None,
             children: Vec::new(),
             last_turn_at: None,
+            trend: None,
         };
         let jnode = to_json_node(&node, None, &thresholds, 30);
         assert_eq!(jnode.model, None);
@@ -585,5 +631,47 @@ mod tests {
         assert!(json_str.contains("\"model\":null"));
         assert!(json_str.contains("\"context_limit\":null"));
         assert!(json_str.contains("\"verdict\":null"));
+    }
+
+    // Trend serialized in JSON output when present.
+    #[test]
+    fn test_json_trend_serialized() {
+        use model::{TimelinePoint, WindowTrend};
+        let thresholds = Thresholds::default();
+        let at = chrono::Utc::now();
+        let node = SessionNode {
+            session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
+            agent_id: None,
+            project_key: "test".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 100_000,
+                fill_percent: 50,
+                model: "claude-sonnet-4-6".to_string(),
+                context_limit: 200_000,
+                window_source: WindowSource::LastTurn,
+                cache_hit_ratio: Some(0.5),
+            }),
+            children: Vec::new(),
+            last_turn_at: None,
+            trend: Some(WindowTrend {
+                points: vec![TimelinePoint {
+                    at,
+                    window_tokens: 100_000,
+                    fill_percent: 50,
+                    cache_hit_ratio: Some(0.5),
+                }],
+                velocity_tokens_per_turn: Some(10_000),
+                projected_turns_to_overbound: Some(10),
+            }),
+        };
+        let jnode = to_json_node(&node, None, &thresholds, 30);
+        let t = jnode.trend.as_ref().expect("trend in json node");
+        assert_eq!(t.velocity_tokens_per_turn, Some(10_000));
+        assert_eq!(t.projected_turns_to_overbound, Some(10));
+        assert_eq!(t.points.len(), 1);
+        assert_eq!(t.points[0].cache_hit_ratio, Some(0.5));
+        let json_str = serde_json::to_string(&jnode).unwrap();
+        assert!(json_str.contains("\"trend\""));
+        assert!(json_str.contains("\"velocity_tokens_per_turn\""));
     }
 }

@@ -11,10 +11,10 @@
 //! `window_source = "aggregate"` (ADR-002's "approximate or unavailable" case).
 
 use crate::{
-    model::{SessionNode, WindowInfo, WindowSource},
+    model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::home_dir,
     provider::Provider,
-    window::compute_window_info,
+    window::{TREND_TAIL_K, compute_trend, compute_window_info, window_limit},
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -135,9 +135,9 @@ fn project_key(conn: &Connection, project_id: Option<&str>, directory: Option<&s
 /// Discover all opencode sessions and assemble parent → child trees via `parent_id`.
 ///
 /// For each session:
-/// 1. Look up the latest `step-finish` part (point-in-time oracle, ADR-005).
-/// 2. If found, compute `WindowInfo` from its `data.tokens` (LastTurn).
-/// 3. Else fall back to `session` aggregate columns (Aggregate).
+/// 1. Query last TREND_TAIL_K step-finish parts (point-in-time oracle, ADR-005/ADR-006).
+/// 2. If found, build WindowInfo + WindowTrend from their `data.tokens` (LastTurn).
+/// 3. Else fall back to `session` aggregate columns (Aggregate), trend = None.
 pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
     let mut stmt = match conn.prepare(
         "SELECT id, parent_id, agent, model, directory, project_id,
@@ -185,11 +185,12 @@ pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
     for row in raw {
         let model = parse_model_id(row.model_json.as_deref());
         let pkey = project_key(conn, row.project_id.as_deref(), row.directory.as_deref());
-        let (window, last_turn_at) = latest_step_finish_window(conn, &row.id, &model)
+        let (window, last_turn_at, trend) = step_finish_oracle(conn, &row.id, &model)
             .unwrap_or_else(|| {
                 (
                     aggregate_window(&row, &model),
                     ts_from_ms(row.time_updated_ms),
+                    None,
                 )
             });
         nodes.push((
@@ -201,6 +202,7 @@ pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
                 window,
                 children: Vec::new(),
                 last_turn_at,
+                trend,
             },
         ));
     }
@@ -248,61 +250,102 @@ pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
     roots
 }
 
-/// Latest `step-finish` part for a session → `(WindowInfo, last_turn_at)`.
-/// Returns `None` if no step-finish part exists or it has no token data.
-fn latest_step_finish_window(
-    conn: &Connection,
-    session_id: &str,
-    model: &str,
-) -> Option<(Option<WindowInfo>, Option<DateTime<Utc>>)> {
-    let data = conn
-        .query_row(
-            "SELECT data FROM part
+/// Query the last TREND_TAIL_K step-finish parts for a session and build the
+/// window + trend.  Returns None when no step-finish parts exist (triggers
+/// aggregate fallback in the caller).
+fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepFinishResult {
+    let mut stmt = conn
+        .prepare(
+            "SELECT data, time_created FROM part
              WHERE session_id = ?1
                AND json_extract(data, '$.type') = 'step-finish'
              ORDER BY time_created DESC
-             LIMIT 1",
-            params![session_id],
-            |r| r.get::<_, Option<String>>(0),
+             LIMIT ?2",
         )
-        .ok()
-        .flatten()?;
+        .ok()?;
 
-    let v: Value = serde_json::from_str(&data).ok()?;
-    let tokens = v.get("tokens")?;
-    let input = tokens.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
-    let cache = tokens.get("cache")?;
-    let cache_read = cache.get("read").and_then(|x| x.as_u64()).unwrap_or(0);
-    let cache_write = cache.get("write").and_then(|x| x.as_u64()).unwrap_or(0);
+    let raw: Vec<(Option<String>, i64)> = stmt
+        .query_map(params![session_id, TREND_TAIL_K as i64], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
 
-    // Time: prefer `time` in the part data, else the part row's time_created.
-    // We reuse the part `time_created` via a second query only if needed; the
-    // spec says the part row's time_created is authoritative, but the data JSON
-    // also carries a `time` field. Use data.time first, fall back to row column.
-    let time_ms = v.get("time").and_then(|t| t.as_i64()).or_else(|| {
-        conn.query_row(
-            "SELECT time_created FROM part
-                 WHERE session_id = ?1
-                   AND json_extract(data, '$.type') = 'step-finish'
-                 ORDER BY time_created DESC LIMIT 1",
-            params![session_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .ok()
-    });
-
-    if input == 0 && cache_read == 0 && cache_write == 0 {
-        return Some((None, ts_from_ms_option(time_ms)));
+    if raw.is_empty() {
+        return None;
     }
 
-    let info = compute_window_info(
-        input,
-        cache_read,
-        cache_write,
-        model,
-        WindowSource::LastTurn,
-    );
-    Some((Some(info), ts_from_ms_option(time_ms)))
+    // Reverse DESC → chronological order (oldest first).
+    let rows: Vec<_> = raw.into_iter().rev().collect();
+
+    let limit = window_limit(model);
+    let mut timeline_points: Vec<TimelinePoint> = Vec::new();
+    let mut last_window: Option<WindowInfo> = None;
+    let mut last_ts: Option<DateTime<Utc>> = None;
+
+    for (data_opt, row_ts_ms) in &rows {
+        let data = match data_opt {
+            Some(d) if !d.is_empty() => d.as_str(),
+            _ => continue,
+        };
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+
+        let tokens = v.get("tokens");
+        let input = tokens
+            .and_then(|t| t.get("input"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let cache = tokens.and_then(|t| t.get("cache"));
+        let cache_read = cache
+            .and_then(|c| c.get("read"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let cache_write = cache
+            .and_then(|c| c.get("write"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+
+        let time_ms = v.get("time").and_then(|t| t.as_i64()).or(Some(*row_ts_ms));
+        let ts = ts_from_ms_option(time_ms);
+
+        if input == 0 && cache_read == 0 && cache_write == 0 {
+            if let Some(t) = ts {
+                last_ts = Some(t);
+            }
+            continue;
+        }
+
+        let info = compute_window_info(
+            input,
+            cache_read,
+            cache_write,
+            model,
+            WindowSource::LastTurn,
+        );
+
+        if let Some(at) = ts {
+            timeline_points.push(TimelinePoint {
+                at,
+                window_tokens: info.window_tokens,
+                fill_percent: info.fill_percent,
+                cache_hit_ratio: info.cache_hit_ratio,
+            });
+            last_ts = Some(at);
+        }
+
+        last_window = Some(info);
+    }
+
+    let trend = if !timeline_points.is_empty() {
+        Some(compute_trend(timeline_points, limit))
+    } else {
+        None
+    };
+
+    Some((last_window, last_ts, trend))
 }
 
 /// Fallback: build an Aggregate WindowInfo from the session's cumulative columns.
@@ -321,6 +364,13 @@ fn aggregate_window(row: &SessionRow, model: &str) -> Option<WindowInfo> {
         WindowSource::Aggregate,
     ))
 }
+
+/// Return type for `step_finish_oracle`: window, timestamp, trend.
+type StepFinishResult = Option<(
+    Option<WindowInfo>,
+    Option<DateTime<Utc>>,
+    Option<WindowTrend>,
+)>;
 
 fn ts_from_ms_option(ms: Option<i64>) -> Option<DateTime<Utc>> {
     ms.and_then(ts_from_ms)
@@ -454,6 +504,8 @@ mod tests {
         assert_eq!(w.window_tokens, 35_000);
         assert_eq!(w.fill_percent, 18);
         assert_eq!(w.window_source, WindowSource::Aggregate);
+        // Aggregate fallback → no trend
+        assert!(nodes[0].trend.is_none());
     }
 
     // TEST-004 case 3: parent_id sub-agent tree (current install is empty, but
@@ -579,5 +631,51 @@ mod tests {
         let nodes = discover_sessions(&conn);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].window.is_none());
+    }
+
+    // ADR-006: two step-finish parts → trend with velocity.
+    #[test]
+    fn test_opencode_trend_from_multiple_step_finish() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_trend', ?1, '/x', NULL, 1719000002000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+
+        // Part 1: 50k tokens
+        let p1 = serde_json::json!({
+            "type": "step-finish", "time": 1719000000000_i64,
+            "tokens": { "input": 50000u64, "cache": { "read": 0u64, "write": 0u64 } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, type, time_created, data)
+             VALUES ('tp1','ses_trend','step-finish',1719000000000,?1)",
+            params![p1],
+        )
+        .unwrap();
+
+        // Part 2: 70k tokens
+        let p2 = serde_json::json!({
+            "type": "step-finish", "time": 1719000002000_i64,
+            "tokens": { "input": 70000u64, "cache": { "read": 0u64, "write": 0u64 } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, type, time_created, data)
+             VALUES ('tp2','ses_trend','step-finish',1719000002000,?1)",
+            params![p2],
+        )
+        .unwrap();
+
+        let nodes = discover_sessions(&conn);
+        assert_eq!(nodes.len(), 1);
+        let trend = nodes[0].trend.as_ref().expect("trend present");
+        assert_eq!(trend.points.len(), 2);
+        // velocity = 70k - 50k = 20k; projection = (200k - 70k) / 20k = 6
+        assert_eq!(trend.velocity_tokens_per_turn, Some(20_000));
+        assert_eq!(trend.projected_turns_to_overbound, Some(6));
     }
 }

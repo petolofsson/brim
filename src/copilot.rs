@@ -114,6 +114,7 @@ fn parse_session_dir(dir: &Path) -> Option<SessionNode> {
         window,
         children: Vec::new(),
         last_turn_at,
+        trend: None,
     })
 }
 
