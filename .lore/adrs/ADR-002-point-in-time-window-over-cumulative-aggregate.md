@@ -7,6 +7,7 @@ related_requirements:
   - REQ-001
   - REQ-004
   - REQ-007
+  - REQ-009
 related_adrs:
   - ADR-001
   - ADR-003
