@@ -1,14 +1,17 @@
 mod claude;
 mod model;
+mod opencode;
 mod parser;
 mod provider;
 mod verdict;
+mod window;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use claude::ClaudeProvider;
 use model::SessionNode;
+use opencode::OpencodeProvider;
 use parser::short_id;
 use provider::Provider;
 use serde::Serialize;
@@ -72,6 +75,8 @@ struct JsonNode {
     window_tokens: Option<u64>,
     fill_percent: Option<u8>,
     verdict: Option<&'static str>,
+    /// Provenance of the reported window occupancy: "last_turn" or "aggregate" (REQ-005).
+    window_source: Option<&'static str>,
     last_turn_at: Option<String>,
     active: bool,
     children: Vec<JsonNode>,
@@ -128,7 +133,7 @@ fn to_json_node(
     thresholds: &Thresholds,
     active_mins: u32,
 ) -> JsonNode {
-    let (window_tokens, fill_percent, model, context_limit, verdict) = node
+    let (window_tokens, fill_percent, model, context_limit, verdict, window_source) = node
         .window
         .as_ref()
         .map(|w| {
@@ -138,9 +143,10 @@ fn to_json_node(
                 Some(w.model.clone()),
                 Some(w.context_limit),
                 Some(thresholds.verdict(w.fill_percent).as_json_str()),
+                Some(w.window_source.as_json_str()),
             )
         })
-        .unwrap_or((None, None, None, None, None));
+        .unwrap_or((None, None, None, None, None, None));
 
     // For sub-agents: session_id = agent_id (the sub-agent's own UUID).
     // For roots: session_id = session_uuid.
@@ -160,6 +166,7 @@ fn to_json_node(
         window_tokens,
         fill_percent,
         verdict,
+        window_source,
         last_turn_at: node.last_turn_at.map(|ts| ts.to_rfc3339()),
         active: is_active(node, active_mins),
         children: node
@@ -183,13 +190,23 @@ fn main() -> Result<()> {
         ceiling: cli.ceiling,
     };
 
-    let provider = ClaudeProvider::new();
-    if !provider.is_available() {
-        println!("claude: no sessions (provider unavailable)");
+    let providers: Vec<Box<dyn Provider>> = vec![
+        Box::new(ClaudeProvider::new()),
+        Box::new(OpencodeProvider::new()),
+    ];
+    if providers.iter().all(|p| !p.is_available()) {
+        println!("brim: no sessions (no provider available)");
         return Ok(());
     }
 
-    let mut sessions = provider.load_sessions();
+    let mut sessions: Vec<SessionNode> = Vec::new();
+    for p in providers.iter().filter(|p| p.is_available()) {
+        sessions.extend(p.load_sessions());
+    }
+    // De-dup not performed: providers may legitimately share a project key; the
+    // project_key field carries the source-provider prefix only when needed for
+    // disambiguation (handled per-provider at load time — opencode already
+    // namespaces by project name, claude by encoded cwd, so collisions are rare).
 
     if let Some(id) = &cli.session {
         sessions.retain(|s| {
@@ -333,7 +350,7 @@ fn print_tree(sessions: &[SessionNode], thresholds: &Thresholds) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::WindowInfo;
+    use model::{WindowInfo, WindowSource};
 
     fn make_node_with_ts(last_turn_at: Option<DateTime<Utc>>) -> SessionNode {
         SessionNode {
@@ -345,6 +362,7 @@ mod tests {
                 fill_percent: 50,
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
+                window_source: WindowSource::LastTurn,
             }),
             children: Vec::new(),
             last_turn_at,
@@ -401,6 +419,7 @@ mod tests {
                 fill_percent: 5,
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
+                window_source: WindowSource::LastTurn,
             }),
             children: Vec::new(),
             last_turn_at: None,
@@ -415,6 +434,7 @@ mod tests {
                 fill_percent: 71,
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
+                window_source: WindowSource::LastTurn,
             }),
             children: vec![child],
             last_turn_at: None,
@@ -455,6 +475,7 @@ mod tests {
                 fill_percent: 95,
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
+                window_source: WindowSource::LastTurn,
             }),
             children: Vec::new(),
             last_turn_at: None,
@@ -490,6 +511,7 @@ mod tests {
                 fill_percent: 25,
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
+                window_source: WindowSource::LastTurn,
             }),
             children: Vec::new(),
             last_turn_at: Some(Utc::now() - chrono::Duration::minutes(5)),
@@ -503,6 +525,7 @@ mod tests {
                 fill_percent: 50,
                 model: "claude-sonnet-4-6".to_string(),
                 context_limit: 200_000,
+                window_source: WindowSource::LastTurn,
             }),
             children: vec![child],
             last_turn_at: Some(Utc::now() - chrono::Duration::hours(2)),

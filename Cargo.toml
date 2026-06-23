@@ -9,3 +9,6 @@ chrono = { version = "0.4", features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# rusqlite+ bundled: read-only access to the opencode SQLite transcript DB.
+# stdlib has no sqlite; bundling avoids a system libsqlite3 dependency (CODERULES r2 deterministic).
+rusqlite = { version = "0.32", features = ["bundled"] }
