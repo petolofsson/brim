@@ -1,4 +1,6 @@
 mod claude;
+mod codex;
+mod copilot;
 mod model;
 mod opencode;
 mod parser;
@@ -10,6 +12,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use claude::ClaudeProvider;
+use codex::CodexProvider;
+use copilot::CopilotProvider;
 use model::SessionNode;
 use opencode::OpencodeProvider;
 use parser::short_id;
@@ -192,7 +196,9 @@ fn main() -> Result<()> {
 
     let providers: Vec<Box<dyn Provider>> = vec![
         Box::new(ClaudeProvider::new()),
+        Box::new(CodexProvider::new()),
         Box::new(OpencodeProvider::new()),
+        Box::new(CopilotProvider::new()),
     ];
     if providers.iter().all(|p| !p.is_available()) {
         println!("brim: no sessions (no provider available)");

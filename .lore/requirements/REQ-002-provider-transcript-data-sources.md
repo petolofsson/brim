@@ -1,7 +1,7 @@
 ---
 id: REQ-002
 title: Provider transcript data sources
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
 related_adrs:

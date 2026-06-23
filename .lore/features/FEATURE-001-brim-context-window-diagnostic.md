@@ -1,7 +1,7 @@
 ---
 id: FEATURE-001
 title: brim context-window diagnostic
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-001
   - REQ-002
@@ -29,7 +29,7 @@ brim is a standalone CLI that reports live context-window occupancy for AI codin
 
 Unlike ctop (which aggregates cumulative token spend), brim reads the point-in-time window: the latest `assistant` turn of each transcript, summing `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` and dividing by the model's context-window limit to produce a fill percentage and a verdict (ok / nearing / over -> recycle).
 
-For Claude Code it assembles a parent -> sub-agent tree (see ADR-001); Codex and Copilot render as flat session lists.
+For Claude Code it assembles a parent -> sub-agent tree (see ADR-001); Codex and Copilot render as flat session lists. The point-in-time window read applies to Claude Code and Codex. Copilot exposes only a cumulative-spend counter (`session.shutdown` `modelMetrics.<model>.usage`), not per-turn window occupancy, so per ADR-002 Copilot sessions are discovered and listed (session id, project, recency) but report no fill % and no verdict (window unavailable).
 
 ## Scope
 
@@ -37,7 +37,7 @@ For Claude Code it assembles a parent -> sub-agent tree (see ADR-001); Codex and
 - `brim --tree`: orchestrator -> sub-agent tree for Claude Code sessions.
 - `brim --session <id>`: scope output to one session and its sub-agents.
 - `brim --once`: single plain-text snapshot (default); a watch/refresh mode may follow.
-- Providers: Claude Code, Codex, Copilot — discovery + last-turn window read.
+- Providers: Claude Code, Codex, Copilot — discovery for all; last-turn window read for Claude Code and Codex. Copilot is discovered and listed but reports no fill/verdict (only a cumulative counter; window unavailable per ADR-002).
 - Per-model window limits (e.g. 200k / 1M) resolved from the session model.
 - Machine-readable `--json` output and active/recency filtering (default active-only, `--all` for historical) for programmatic orchestration.
 
