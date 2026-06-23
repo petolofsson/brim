@@ -29,11 +29,11 @@ impl Verdict {
 pub enum VerdictGate {
     /// (c) absolute active tokens ≥ recycle_backstop
     AbsoluteBackstop,
-    /// (b) projected turns to overbound ≤ PROJECTION_RECYCLE_TURNS
-    ProjectionOverbound,
+    /// (b) projected turns to recycle ≤ PROJECTION_RECYCLE_TURNS
+    ProjectionRecycle,
     /// (c) absolute active tokens ≥ watch_tokens
     AbsoluteWatch,
-    /// (b) projected turns to overbound ≤ PROJECTION_NEARING_TURNS
+    /// (b) projected turns to recycle ≤ PROJECTION_NEARING_TURNS
     ProjectionNearing,
     /// (d) cache_hit_ratio < CACHE_THRASH_THRESHOLD (Nearing only, ADR-008)
     CacheThrash,
@@ -43,7 +43,7 @@ impl VerdictGate {
     pub fn as_str(self) -> &'static str {
         match self {
             VerdictGate::AbsoluteBackstop => "abs-backstop",
-            VerdictGate::ProjectionOverbound => "projection",
+            VerdictGate::ProjectionRecycle => "projection_recycle",
             VerdictGate::AbsoluteWatch => "abs-watch",
             VerdictGate::ProjectionNearing => "projection",
             VerdictGate::CacheThrash => "cache-thrash",
@@ -53,7 +53,7 @@ impl VerdictGate {
     pub fn as_json_str(self) -> &'static str {
         match self {
             VerdictGate::AbsoluteBackstop => "absolute_backstop",
-            VerdictGate::ProjectionOverbound => "projection_overbound",
+            VerdictGate::ProjectionRecycle => "projection_recycle",
             VerdictGate::AbsoluteWatch => "absolute_watch",
             VerdictGate::ProjectionNearing => "projection_nearing",
             VerdictGate::CacheThrash => "cache_thrash",
@@ -90,7 +90,7 @@ pub fn absolute_verdict(
         return (Verdict::Over, Some(VerdictGate::AbsoluteBackstop));
     }
     if projected_turns.is_some_and(|t| t <= PROJECTION_RECYCLE_TURNS) {
-        return (Verdict::Over, Some(VerdictGate::ProjectionOverbound));
+        return (Verdict::Over, Some(VerdictGate::ProjectionRecycle));
     }
     // Nearing gates
     if window_tokens >= watch_tokens {
@@ -108,14 +108,9 @@ pub fn absolute_verdict(
     (Verdict::Ok, None)
 }
 
-/// Capacity-runway thresholds: maps fill % to distance from auto-compaction (~95% of
-/// advertised window). DEMOTED from quality-verdict driver (ADR-010) — used only for
-/// the capacity-runway readout in output; the quality verdict uses `absolute_verdict`.
-/// Also carries the runtime-configurable absolute bands (REQ-004, ADR-010 caveat #1).
+/// Absolute-token thresholds for the quality verdict (REQ-004, ADR-010 caveat #1).
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
-    pub nearing: u8,
-    pub ceiling: u8,
     /// Absolute active-token watch band (default: ABSOLUTE_WATCH_TOKENS per ADR-010 research).
     pub watch_tokens: u64,
     /// Absolute recycle backstop (default: ABSOLUTE_RECYCLE_BACKSTOP per ADR-010 research).
@@ -125,34 +120,8 @@ pub struct Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            nearing: 70,
-            ceiling: 90,
             watch_tokens: ABSOLUTE_WATCH_TOKENS,
             recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
-        }
-    }
-}
-
-impl Thresholds {
-    /// Capacity-runway readout: distance to forced auto-compaction (~95% of advertised window).
-    pub fn runway(self, fill_percent: u8) -> Verdict {
-        if fill_percent >= self.ceiling {
-            Verdict::Over
-        } else if fill_percent >= self.nearing {
-            Verdict::Nearing
-        } else {
-            Verdict::Ok
-        }
-    }
-
-    /// Capacity-runway vocab for JSON output — distinct from Verdict strings (N2).
-    pub fn runway_capacity_str(self, fill_percent: u8) -> &'static str {
-        if fill_percent >= self.ceiling {
-            "at_compaction"
-        } else if fill_percent >= self.nearing {
-            "nearing_compaction"
-        } else {
-            "ample"
         }
     }
 }
@@ -229,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_verdict_over_projection_overbound() {
+    fn absolute_verdict_over_projection_recycle() {
         let (v, gate) = absolute_verdict(
             20_000,
             Some(1),
@@ -238,7 +207,7 @@ mod tests {
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
         assert_eq!(v, Verdict::Over);
-        assert_eq!(gate, Some(VerdictGate::ProjectionOverbound));
+        assert_eq!(gate, Some(VerdictGate::ProjectionRecycle));
     }
 
     #[test]
@@ -251,7 +220,7 @@ mod tests {
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
         assert_eq!(v, Verdict::Over);
-        assert_eq!(gate, Some(VerdictGate::ProjectionOverbound));
+        assert_eq!(gate, Some(VerdictGate::ProjectionRecycle));
     }
 
     #[test]
@@ -319,7 +288,7 @@ mod tests {
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
         assert_eq!(v, Verdict::Over);
-        assert_eq!(gate, Some(VerdictGate::ProjectionOverbound));
+        assert_eq!(gate, Some(VerdictGate::ProjectionRecycle));
     }
 
     // N3: boundary tests
@@ -378,40 +347,5 @@ mod tests {
         );
         assert_eq!(v, Verdict::Ok);
         assert_eq!(gate, None);
-    }
-
-    // Runway tests (demoted %-based capacity readout, ADR-010)
-
-    #[test]
-    fn runway_ok() {
-        let t = Thresholds::default();
-        assert_eq!(t.runway(0), Verdict::Ok);
-        assert_eq!(t.runway(69), Verdict::Ok);
-    }
-
-    #[test]
-    fn runway_nearing() {
-        let t = Thresholds::default();
-        assert_eq!(t.runway(70), Verdict::Nearing);
-        assert_eq!(t.runway(89), Verdict::Nearing);
-    }
-
-    #[test]
-    fn runway_over() {
-        let t = Thresholds::default();
-        assert_eq!(t.runway(90), Verdict::Over);
-        assert_eq!(t.runway(100), Verdict::Over);
-    }
-
-    // N2: capacity_runway vocab
-    #[test]
-    fn runway_capacity_str_vocab() {
-        let t = Thresholds::default();
-        assert_eq!(t.runway_capacity_str(0), "ample");
-        assert_eq!(t.runway_capacity_str(69), "ample");
-        assert_eq!(t.runway_capacity_str(70), "nearing_compaction");
-        assert_eq!(t.runway_capacity_str(89), "nearing_compaction");
-        assert_eq!(t.runway_capacity_str(90), "at_compaction");
-        assert_eq!(t.runway_capacity_str(100), "at_compaction");
     }
 }

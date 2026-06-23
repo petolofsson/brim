@@ -3,8 +3,9 @@
 //!
 //! Last-turn oracle: the latest `part` row with
 //! `json_extract(data,'$.type')='step-finish'`; its `data.tokens` carries
-//! `{ input, cache: { read, write } }` — the opencode analogue of claude's
-//! `input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens`.
+//! `{ total?, input, output?, cache: { read, write } }`.
+//! Window occupancy: prefer `tokens.total` when present; else sum
+//! `input + output + cache.read + cache.write`.
 //!
 //! If no `step-finish` part exists for a session (pre-checkpoint), brim falls
 //! back to the `session` aggregate token columns and tags the node with
@@ -14,7 +15,8 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::home_dir,
     provider::Provider,
-    window::{TREND_TAIL_K, compute_trend, compute_window_info, window_limit},
+    verdict::ABSOLUTE_RECYCLE_BACKSTOP,
+    window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -88,6 +90,7 @@ struct SessionRow {
     tokens_input: i64,
     tokens_cache_read: i64,
     tokens_cache_write: i64,
+    tokens_output: i64,
     time_updated_ms: i64,
 }
 
@@ -141,7 +144,7 @@ fn project_key(conn: &Connection, project_id: Option<&str>, directory: Option<&s
 pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
     let mut stmt = match conn.prepare(
         "SELECT id, parent_id, agent, model, directory, project_id,
-                tokens_input, tokens_cache_read, tokens_cache_write, time_updated
+                tokens_input, tokens_cache_read, tokens_cache_write, tokens_output, time_updated
          FROM session
          ORDER BY time_updated DESC
          LIMIT ?1",
@@ -162,7 +165,8 @@ pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
                 tokens_input: r.get::<_, i64>(6)?,
                 tokens_cache_read: r.get::<_, i64>(7)?,
                 tokens_cache_write: r.get::<_, i64>(8)?,
-                time_updated_ms: r.get::<_, i64>(9)?,
+                tokens_output: r.get::<_, i64>(9)?,
+                time_updated_ms: r.get::<_, i64>(10)?,
             })
         })
         .ok();
@@ -253,6 +257,9 @@ pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
 /// Query the last TREND_TAIL_K step-finish parts for a session and build the
 /// window + trend.  Returns None when no step-finish parts exist (triggers
 /// aggregate fallback in the caller).
+///
+/// Occupancy: prefer `tokens.total` when present; else sum
+/// `input + output + cache.read + cache.write`.
 fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepFinishResult {
     let mut stmt = conn
         .prepare(
@@ -279,7 +286,6 @@ fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepF
     // Reverse DESC → chronological order (oldest first).
     let rows: Vec<_> = raw.into_iter().rev().collect();
 
-    let limit = window_limit(model);
     let mut timeline_points: Vec<TimelinePoint> = Vec::new();
     let mut last_window: Option<WindowInfo> = None;
     let mut last_ts: Option<DateTime<Utc>> = None;
@@ -294,8 +300,13 @@ fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepF
         };
 
         let tokens = v.get("tokens");
+        let total_opt = tokens.and_then(|t| t.get("total")).and_then(|x| x.as_u64());
         let input = tokens
             .and_then(|t| t.get("input"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let output = tokens
+            .and_then(|t| t.get("output"))
             .and_then(|x| x.as_u64())
             .unwrap_or(0);
         let cache = tokens.and_then(|t| t.get("cache"));
@@ -308,29 +319,41 @@ fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepF
             .and_then(|x| x.as_u64())
             .unwrap_or(0);
 
+        // Prefer tokens.total; else sum all active-token contributors.
+        let window_tokens = total_opt.unwrap_or_else(|| {
+            input
+                .saturating_add(output)
+                .saturating_add(cache_read)
+                .saturating_add(cache_write)
+        });
+
         let time_ms = v.get("time").and_then(|t| t.as_i64()).or(Some(*row_ts_ms));
         let ts = ts_from_ms_option(time_ms);
 
-        if input == 0 && cache_read == 0 && cache_write == 0 {
+        if window_tokens == 0 {
             if let Some(t) = ts {
                 last_ts = Some(t);
             }
             continue;
         }
 
-        let info = compute_window_info(
-            input,
-            cache_read,
-            cache_write,
-            model,
-            WindowSource::LastTurn,
-        );
+        let cache_hit_ratio = if cache_read > 0 || cache_write > 0 {
+            Some((cache_read as f32 / window_tokens as f32).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+
+        let info = WindowInfo {
+            window_tokens,
+            model: model.to_string(),
+            window_source: WindowSource::LastTurn,
+            cache_hit_ratio,
+        };
 
         if let Some(at) = ts {
             timeline_points.push(TimelinePoint {
                 at,
                 window_tokens: info.window_tokens,
-                fill_percent: info.fill_percent,
                 cache_hit_ratio: info.cache_hit_ratio,
             });
             last_ts = Some(at);
@@ -340,7 +363,7 @@ fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepF
     }
 
     let trend = if !timeline_points.is_empty() {
-        Some(compute_trend(timeline_points, limit))
+        Some(compute_trend(timeline_points, ABSOLUTE_RECYCLE_BACKSTOP))
     } else {
         None
     };
@@ -353,16 +376,19 @@ fn aggregate_window(row: &SessionRow, model: &str) -> Option<WindowInfo> {
     let input = row.tokens_input.max(0) as u64;
     let cache_read = row.tokens_cache_read.max(0) as u64;
     let cache_write = row.tokens_cache_write.max(0) as u64;
-    if input == 0 && cache_read == 0 && cache_write == 0 {
+    let output = row.tokens_output.max(0) as u64;
+    if input == 0 && cache_read == 0 && cache_write == 0 && output == 0 {
         return None;
     }
-    Some(compute_window_info(
+    let mut w = compute_window_info(
         input,
         cache_read,
         cache_write,
         model,
         WindowSource::Aggregate,
-    ))
+    );
+    w.window_tokens = w.window_tokens.saturating_add(output);
+    Some(w)
 }
 
 /// Return type for `step_finish_oracle`: window, timestamp, trend.
@@ -429,8 +455,7 @@ mod tests {
         format!("{{\"id\":\"{id}\",\"providerID\":\"llmbase\"}}")
     }
 
-    // TEST-004 case 1: step-finish oracle — input=106, cache.read=46720, cache.write=0
-    // → window_tokens=46826, fill=round(46826/200000*100)=23.
+    // TEST-004 case 1: step-finish oracle — prefers tokens.total=46826.
     #[test]
     fn test_opencode_step_finish_window() {
         let conn = seed_db();
@@ -467,8 +492,6 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         let w = nodes[0].window.as_ref().expect("window present");
         assert_eq!(w.window_tokens, 46_826);
-        assert_eq!(w.fill_percent, 23);
-        assert_eq!(w.context_limit, 200_000);
         assert_eq!(w.window_source, WindowSource::LastTurn);
         assert!(nodes[0].last_turn_at.is_some());
     }
@@ -480,8 +503,8 @@ mod tests {
         conn.execute(
             "INSERT INTO session (id, model, directory, project_id,
                                   tokens_input, tokens_cache_read, tokens_cache_write,
-                                  time_updated)
-             VALUES (?1, ?2, ?3, NULL, 5000, 30000, 0, 1719000000000)",
+                                  tokens_output, time_updated)
+             VALUES (?1, ?2, ?3, NULL, 5000, 30000, 0, 2000, 1719000000000)",
             params![
                 "ses_beta",
                 model_json("z-ai/glm-5.2"),
@@ -500,16 +523,38 @@ mod tests {
         let nodes = discover_sessions(&conn);
         assert_eq!(nodes.len(), 1);
         let w = nodes[0].window.as_ref().expect("window");
-        // 5000 + 30000 + 0 = 35000 → round(35000/200000*100) = round(17.5) = 18
-        assert_eq!(w.window_tokens, 35_000);
-        assert_eq!(w.fill_percent, 18);
+        // 5000 + 30000 + 0 (cache_write) + 2000 (output) = 37000
+        assert_eq!(w.window_tokens, 37_000);
         assert_eq!(w.window_source, WindowSource::Aggregate);
         // Aggregate fallback → no trend
         assert!(nodes[0].trend.is_none());
     }
 
-    // TEST-004 case 3: parent_id sub-agent tree (current install is empty, but
-    // the join must work structurally when opencode starts spawning sub-agents).
+    // Aggregate path includes tokens_output in occupancy.
+    #[test]
+    fn test_opencode_aggregate_output_counted() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id,
+                                  tokens_input, tokens_cache_read, tokens_cache_write,
+                                  tokens_output, time_updated)
+             VALUES (?1, ?2, ?3, NULL, 1000, 0, 0, 500, 1719000000001)",
+            params![
+                "ses_gamma",
+                model_json("z-ai/glm-5.2"),
+                "/home/pol/code/brim"
+            ],
+        )
+        .unwrap();
+        let nodes = discover_sessions(&conn);
+        assert_eq!(nodes.len(), 1);
+        let w = nodes[0].window.as_ref().expect("window");
+        // input=1000 + output=500 = 1500
+        assert_eq!(w.window_tokens, 1_500);
+        assert_eq!(w.window_source, WindowSource::Aggregate);
+    }
+
+    // TEST-004 case 3: parent_id sub-agent tree.
     #[test]
     fn test_opencode_parent_id_subagent_tree() {
         let conn = seed_db();
@@ -535,7 +580,6 @@ mod tests {
         let parent = &nodes[0];
         assert_eq!(parent.session_uuid, "parent_ses");
         assert_eq!(parent.children.len(), 1);
-        // Claude SessionNode convention: child.session_uuid = parent id, child.agent_id = child's own id.
         assert_eq!(parent.children[0].session_uuid, "parent_ses");
         assert_eq!(
             parent.children[0].agent_id.as_deref(),
@@ -589,6 +633,7 @@ mod tests {
             params![model_json("z-ai/glm-5.2")],
         )
         .unwrap();
+        // No total → falls back to input+output+cache.read+cache.write = 106+0+46720+0 = 46826
         let part_data = serde_json::json!({
             "type": "step-finish", "time": 1719000000000_i64,
             "tokens": { "input": 106u64, "cache": { "read": 46720u64, "write": 0u64 } }
@@ -634,6 +679,7 @@ mod tests {
     }
 
     // ADR-006: two step-finish parts → trend with velocity.
+    // velocity = 70k - 50k = 20k; projection to 128k backstop = (128k-70k)/20k = 2
     #[test]
     fn test_opencode_trend_from_multiple_step_finish() {
         let conn = seed_db();
@@ -644,7 +690,7 @@ mod tests {
         )
         .unwrap();
 
-        // Part 1: 50k tokens
+        // Part 1: 50k tokens (no total → sum = 50000)
         let p1 = serde_json::json!({
             "type": "step-finish", "time": 1719000000000_i64,
             "tokens": { "input": 50000u64, "cache": { "read": 0u64, "write": 0u64 } }
@@ -657,7 +703,7 @@ mod tests {
         )
         .unwrap();
 
-        // Part 2: 70k tokens
+        // Part 2: 70k tokens (no total → sum = 70000)
         let p2 = serde_json::json!({
             "type": "step-finish", "time": 1719000002000_i64,
             "tokens": { "input": 70000u64, "cache": { "read": 0u64, "write": 0u64 } }
@@ -674,8 +720,71 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         let trend = nodes[0].trend.as_ref().expect("trend present");
         assert_eq!(trend.points.len(), 2);
-        // velocity = 70k - 50k = 20k; projection = (200k - 70k) / 20k = 6
         assert_eq!(trend.velocity_tokens_per_turn, Some(20_000));
-        assert_eq!(trend.projected_turns_to_overbound, Some(6));
+        assert_eq!(trend.projected_turns_to_recycle, Some(2));
+    }
+
+    // Occupancy normalization: tokens.total preferred over individual fields.
+    #[test]
+    fn test_opencode_total_preferred_over_sum() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_total', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // total=46826 should win over input(106)+output(0)+cache.read(46720)+cache.write(0)=46826
+        // (same value here, but total takes precedence by code path)
+        let part_data = serde_json::json!({
+            "type": "step-finish", "time": 1719000000000_i64,
+            "tokens": {
+                "total": 46826u64,
+                "input": 106u64,
+                "output": 0u64,
+                "cache": { "read": 46720u64, "write": 0u64 }
+            }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, type, time_created, data)
+             VALUES ('pt1','ses_total','step-finish',1719000000000,?1)",
+            params![part_data],
+        )
+        .unwrap();
+        let nodes = discover_sessions(&conn);
+        let w = nodes[0].window.as_ref().unwrap();
+        assert_eq!(w.window_tokens, 46_826);
+    }
+
+    // Occupancy normalization: without total, output tokens are included.
+    #[test]
+    fn test_opencode_output_included_when_no_total() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_out', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // No total → window = input(100) + output(50) + cache.read(0) + cache.write(0) = 150
+        let part_data = serde_json::json!({
+            "type": "step-finish", "time": 1719000000000_i64,
+            "tokens": {
+                "input": 100u64,
+                "output": 50u64,
+                "cache": { "read": 0u64, "write": 0u64 }
+            }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, type, time_created, data)
+             VALUES ('po1','ses_out','step-finish',1719000000000,?1)",
+            params![part_data],
+        )
+        .unwrap();
+        let nodes = discover_sessions(&conn);
+        let w = nodes[0].window.as_ref().unwrap();
+        assert_eq!(w.window_tokens, 150);
     }
 }

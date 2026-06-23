@@ -2,6 +2,7 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
+    verdict::ABSOLUTE_RECYCLE_BACKSTOP,
     window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use chrono::{DateTime, Utc};
@@ -144,7 +145,6 @@ fn parse_transcript(
     );
     let last_ts = last.ts;
     let last_model = last.model.clone();
-    let limit = window_info.context_limit;
 
     // Build timeline points for turns that carry a timestamp.
     let timeline_points: Vec<TimelinePoint> = turns
@@ -161,14 +161,13 @@ fn parse_transcript(
             Some(TimelinePoint {
                 at,
                 window_tokens: info.window_tokens,
-                fill_percent: info.fill_percent,
                 cache_hit_ratio: info.cache_hit_ratio,
             })
         })
         .collect();
 
     let trend = if !timeline_points.is_empty() {
-        Some(compute_trend(timeline_points, limit))
+        Some(compute_trend(timeline_points, ABSOLUTE_RECYCLE_BACKSTOP))
     } else {
         None
     };
@@ -300,13 +299,12 @@ mod tests {
             "claude-sonnet-4-6",
             WindowSource::LastTurn,
         );
-        // saturating_add clamps window_tokens to u64::MAX; fill must be bounded to 100.
-        assert_eq!(info.fill_percent, 100);
+        assert_eq!(info.window_tokens, u64::MAX);
     }
 
-    // TEST-001: window-fill math from the last-turn oracle (142000 → 71%), bounded [0,100].
+    // TEST-001: window-fill math from the last-turn oracle (142000 tokens).
     #[test]
-    fn test_window_fill_math_oracle() {
+    fn test_window_tokens_math_oracle() {
         let info = compute_window_info(
             7_000,
             130_000,
@@ -315,37 +313,6 @@ mod tests {
             WindowSource::LastTurn,
         );
         assert_eq!(info.window_tokens, 142_000);
-        assert_eq!(info.fill_percent, 71);
-    }
-
-    #[test]
-    fn test_window_fill_bounded_at_100() {
-        let info = compute_window_info(
-            200_000,
-            100_000,
-            50_000,
-            "claude-sonnet-4-6",
-            WindowSource::LastTurn,
-        );
-        assert_eq!(info.fill_percent, 100);
-    }
-
-    #[test]
-    fn test_window_limit_1m_model() {
-        // 500k/1M = 50% — verifies the [1m] model limit is applied correctly
-        let info =
-            compute_window_info(500_000, 0, 0, "claude-opus-4-8[1m]", WindowSource::LastTurn);
-        assert_eq!(info.fill_percent, 50);
-        assert_eq!(info.window_tokens, 500_000);
-    }
-
-    #[test]
-    fn test_context_limit_stored() {
-        let info = compute_window_info(100_000, 0, 0, "claude-sonnet-4-6", WindowSource::LastTurn);
-        assert_eq!(info.context_limit, 200_000);
-        let info_1m =
-            compute_window_info(100_000, 0, 0, "claude-opus-4-8[1m]", WindowSource::LastTurn);
-        assert_eq!(info_1m.context_limit, 1_000_000);
     }
 
     #[test]
@@ -372,11 +339,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         let w = sessions[0].window.as_ref().unwrap();
         assert_eq!(w.window_tokens, 142_000);
-        assert_eq!(w.fill_percent, 71);
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    // TEST-002: tree assembly — parent + two sub-agents, childless session, independent fills.
+    // TEST-002: tree assembly — parent + two sub-agents, childless session, independent tokens.
     #[test]
     fn test_tree_assembly() {
         let tmp = std::env::temp_dir().join("brim_test_tree");
@@ -412,8 +378,7 @@ mod tests {
         assert_eq!(parent.session_uuid, parent_uuid);
         assert_eq!(parent.children.len(), 2, "two sub-agents expected");
 
-        // Independent fills
-        assert_eq!(parent.window.as_ref().unwrap().fill_percent, 25); // 50000/200000 = 25%
+        assert_eq!(parent.window.as_ref().unwrap().window_tokens, 50_000);
 
         let ca = parent
             .children
@@ -425,8 +390,8 @@ mod tests {
             .iter()
             .find(|c| c.agent_id.as_deref() == Some(agent_b))
             .expect("agent B");
-        assert_eq!(ca.window.as_ref().unwrap().fill_percent, 5); // 10000/200000 = 5%
-        assert_eq!(cb.window.as_ref().unwrap().fill_percent, 10); // 20000/200000 = 10%
+        assert_eq!(ca.window.as_ref().unwrap().window_tokens, 10_000);
+        assert_eq!(cb.window.as_ref().unwrap().window_tokens, 20_000);
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -503,7 +468,7 @@ mod tests {
         let sessions = discover_project(&tmp);
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].window.is_some());
-        assert_eq!(sessions[0].window.as_ref().unwrap().fill_percent, 20); // 40000/200000 = 20%
+        assert_eq!(sessions[0].window.as_ref().unwrap().window_tokens, 40_000);
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -564,6 +529,7 @@ mod tests {
     }
 
     // Trend: two turns with timestamps → trend has 2 points; velocity computed.
+    // velocity = 70k - 50k = 20k; projection = (128k - 70k) / 20k = 2 (58k/20k=2)
     #[test]
     fn test_trend_built_from_multiple_turns() {
         let tmp = std::env::temp_dir().join("brim_test_trend");
@@ -579,9 +545,8 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         let trend = sessions[0].trend.as_ref().expect("trend present");
         assert_eq!(trend.points.len(), 2);
-        // velocity = 70k - 50k = 20k; projection = (200k-70k)/20k = 6
         assert_eq!(trend.velocity_tokens_per_turn, Some(20_000));
-        assert_eq!(trend.projected_turns_to_overbound, Some(6));
+        assert_eq!(trend.projected_turns_to_recycle, Some(2));
         let _ = fs::remove_dir_all(&tmp);
     }
 

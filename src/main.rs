@@ -43,14 +43,6 @@ struct Cli {
     #[arg(long)]
     once: bool,
 
-    /// Fill % at which verdict becomes 'nearing' (default: 70)
-    #[arg(long, default_value_t = 70)]
-    nearing: u8,
-
-    /// Fill % at which verdict becomes 'over -> recycle' (default: 90)
-    #[arg(long, default_value_t = 90)]
-    ceiling: u8,
-
     /// Absolute active-token watch band; research-anchored per ADR-010 (default: 32000)
     #[arg(long, default_value_t = 32_000)]
     watch_tokens: u64,
@@ -76,7 +68,6 @@ struct Cli {
 struct JsonTimelinePoint {
     at: String,
     window_tokens: u64,
-    fill_percent: u8,
     cache_hit_ratio: Option<f32>,
 }
 
@@ -84,7 +75,7 @@ struct JsonTimelinePoint {
 struct JsonWindowTrend {
     points: Vec<JsonTimelinePoint>,
     velocity_tokens_per_turn: Option<u64>,
-    projected_turns_to_overbound: Option<u32>,
+    projected_turns_to_recycle: Option<u32>,
 }
 
 /// Subtree aggregation over a node + all descendants (ADR-007).
@@ -92,8 +83,8 @@ struct JsonWindowTrend {
 #[derive(Serialize)]
 struct JsonSubtreeInfo {
     total_subtree_tokens: u64,
-    worst_fill_percent: u8,
-    worst_fill_node: String,
+    worst_tokens: u64,
+    worst_tokens_node: String,
     worst_projection: Option<u32>,
     worst_projection_node: Option<String>,
     max_velocity: Option<u64>,
@@ -130,15 +121,11 @@ struct JsonNode {
     agent_id: Option<String>,
     project: String,
     model: Option<String>,
-    context_limit: Option<u64>,
     window_tokens: Option<u64>,
-    fill_percent: Option<u8>,
     /// Quality verdict: OR of ADR-010 absolute-budget, projection, and cache-thrash signals.
     verdict: Option<&'static str>,
     /// Which ADR-010 OR-gate fired (null when verdict is ok).
     verdict_gate: Option<&'static str>,
-    /// Capacity runway: fill % mapped to distance from auto-compaction (ADR-010 §2).
-    capacity_runway: Option<&'static str>,
     /// Provenance of the reported window occupancy: "last_turn" or "aggregate" (REQ-005).
     window_source: Option<&'static str>,
     last_turn_at: Option<String>,
@@ -223,40 +210,29 @@ fn to_json_node(
     active_mins: u32,
     rec: Option<JsonRecycleRecommendation>,
 ) -> JsonNode {
-    let (
-        window_tokens,
-        fill_percent,
-        model,
-        context_limit,
-        verdict,
-        verdict_gate,
-        capacity_runway,
-        window_source,
-    ) = if let Some(w) = node.window.as_ref() {
-        let projected_turns = node
-            .trend
-            .as_ref()
-            .and_then(|t| t.projected_turns_to_overbound);
-        let (v, gate) = absolute_verdict(
-            w.window_tokens,
-            projected_turns,
-            w.cache_hit_ratio,
-            thresholds.watch_tokens,
-            thresholds.recycle_backstop,
-        );
-        (
-            Some(w.window_tokens),
-            Some(w.fill_percent),
-            Some(w.model.clone()),
-            Some(w.context_limit),
-            Some(v.as_json_str()),
-            gate.map(|g| g.as_json_str()),
-            Some(thresholds.runway_capacity_str(w.fill_percent)),
-            Some(w.window_source.as_json_str()),
-        )
-    } else {
-        (None, None, None, None, None, None, None, None)
-    };
+    let (window_tokens, model, verdict, verdict_gate, window_source) =
+        if let Some(w) = node.window.as_ref() {
+            let projected_turns = node
+                .trend
+                .as_ref()
+                .and_then(|t| t.projected_turns_to_recycle);
+            let (v, gate) = absolute_verdict(
+                w.window_tokens,
+                projected_turns,
+                w.cache_hit_ratio,
+                thresholds.watch_tokens,
+                thresholds.recycle_backstop,
+            );
+            (
+                Some(w.window_tokens),
+                Some(w.model.clone()),
+                Some(v.as_json_str()),
+                gate.map(|g| g.as_json_str()),
+                Some(w.window_source.as_json_str()),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
 
     // For sub-agents: session_id = agent_id (the sub-agent's own UUID).
     // For roots: session_id = session_uuid.
@@ -273,18 +249,17 @@ fn to_json_node(
             .map(|p| JsonTimelinePoint {
                 at: p.at.to_rfc3339(),
                 window_tokens: p.window_tokens,
-                fill_percent: p.fill_percent,
                 cache_hit_ratio: p.cache_hit_ratio,
             })
             .collect(),
         velocity_tokens_per_turn: t.velocity_tokens_per_turn,
-        projected_turns_to_overbound: t.projected_turns_to_overbound,
+        projected_turns_to_recycle: t.projected_turns_to_recycle,
     });
 
     let subtree = JsonSubtreeInfo {
         total_subtree_tokens: si.total_subtree_tokens,
-        worst_fill_percent: si.worst_fill_percent,
-        worst_fill_node: si.worst_fill_node.clone(),
+        worst_tokens: si.worst_tokens,
+        worst_tokens_node: si.worst_tokens_node.clone(),
         worst_projection: si.worst_projection,
         worst_projection_node: si.worst_projection_node.clone(),
         max_velocity: si.max_velocity,
@@ -298,12 +273,9 @@ fn to_json_node(
         agent_id: node.agent_id.clone(),
         project: node.project_key.clone(),
         model,
-        context_limit,
         window_tokens,
-        fill_percent,
         verdict,
         verdict_gate,
-        capacity_runway,
         window_source,
         last_turn_at: node.last_turn_at.map(|ts| ts.to_rfc3339()),
         active: is_active(node, active_mins),
@@ -331,20 +303,12 @@ fn to_json_node(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     anyhow::ensure!(
-        cli.nearing <= cli.ceiling && cli.ceiling <= 100,
-        "--nearing ({}) must be \u{2264} --ceiling ({}) and --ceiling must be \u{2264} 100",
-        cli.nearing,
-        cli.ceiling,
-    );
-    anyhow::ensure!(
         cli.watch_tokens <= cli.recycle_backstop,
         "--watch-tokens ({}) must be \u{2264} --recycle-backstop ({})",
         cli.watch_tokens,
         cli.recycle_backstop,
     );
     let thresholds = Thresholds {
-        nearing: cli.nearing,
-        ceiling: cli.ceiling,
         watch_tokens: cli.watch_tokens,
         recycle_backstop: cli.recycle_backstop,
     };
@@ -390,7 +354,7 @@ fn main() -> Result<()> {
     }
 
     // Sort worst-first. Sort key: worst verdict (Over > Nearing > Ok) desc,
-    // earliest projection asc (None = infinity → last), highest fill desc. Deterministic.
+    // earliest projection asc (None = infinity → last), highest tokens desc. Deterministic.
     let mut pairs: Vec<(SubtreeInfo, SessionNode)> = sessions
         .into_iter()
         .map(|s| {
@@ -406,7 +370,7 @@ fn main() -> Result<()> {
                     .unwrap_or(u32::MAX)
                     .cmp(&sb.worst_projection.unwrap_or(u32::MAX))
             })
-            .then_with(|| sb.worst_fill_percent.cmp(&sa.worst_fill_percent))
+            .then_with(|| sb.worst_tokens.cmp(&sa.worst_tokens))
     });
 
     if cli.json {
@@ -452,19 +416,6 @@ fn tokens_str(node: &SessionNode) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// Capacity-runway readout column. Suffix '~' = nearing auto-compaction, '!' = at/over.
-fn fill_str(node: &SessionNode, thresholds: &Thresholds) -> String {
-    let Some(w) = node.window.as_ref() else {
-        return "-".to_string();
-    };
-    let suffix = match thresholds.runway(w.fill_percent) {
-        Verdict::Over => "!",
-        Verdict::Nearing => "~",
-        Verdict::Ok => "",
-    };
-    format!("{}%{}", w.fill_percent, suffix)
-}
-
 fn verdict_str(node: &SessionNode, thresholds: &Thresholds) -> String {
     let Some(w) = node.window.as_ref() else {
         return "-".to_string();
@@ -472,7 +423,7 @@ fn verdict_str(node: &SessionNode, thresholds: &Thresholds) -> String {
     let projected_turns = node
         .trend
         .as_ref()
-        .and_then(|t| t.projected_turns_to_overbound);
+        .and_then(|t| t.projected_turns_to_recycle);
     let (v, gate) = absolute_verdict(
         w.window_tokens,
         projected_turns,
@@ -529,7 +480,7 @@ fn sort_children_worst_first(node: &mut SessionNode, thresholds: &Thresholds) {
                     .unwrap_or(u32::MAX)
                     .cmp(&sb.worst_projection.unwrap_or(u32::MAX))
             })
-            .then_with(|| sb.worst_fill_percent.cmp(&sa.worst_fill_percent))
+            .then_with(|| sb.worst_tokens.cmp(&sa.worst_tokens))
     });
     node.children = child_pairs.into_iter().map(|(_, c)| c).collect();
 }
@@ -573,8 +524,8 @@ fn print_subtree_summary(pairs: &[(SubtreeInfo, SessionNode)]) {
         return;
     }
     let mut total_tokens: u64 = 0;
-    let mut worst_fill: u8 = 0;
-    let mut worst_fill_node = String::new();
+    let mut worst_tokens: u64 = 0;
+    let mut worst_tokens_node = String::new();
     let mut worst_proj: Option<u32> = None;
     let mut worst_proj_node = String::new();
     let mut worst_verd = Verdict::Ok;
@@ -583,9 +534,9 @@ fn print_subtree_summary(pairs: &[(SubtreeInfo, SessionNode)]) {
 
     for (si, _) in pairs {
         total_tokens = total_tokens.saturating_add(si.total_subtree_tokens);
-        if !initialized || si.worst_fill_percent > worst_fill {
-            worst_fill = si.worst_fill_percent;
-            worst_fill_node = short_id(&si.worst_fill_node);
+        if !initialized || si.worst_tokens > worst_tokens {
+            worst_tokens = si.worst_tokens;
+            worst_tokens_node = short_id(&si.worst_tokens_node);
         }
         match (worst_proj, si.worst_projection) {
             (None, Some(v)) => {
@@ -619,7 +570,7 @@ fn print_subtree_summary(pairs: &[(SubtreeInfo, SessionNode)]) {
         None => "-".to_string(),
     };
     println!(
-        "SUBTREE  all={total_tokens} tok  worst-fill={worst_fill}%({worst_fill_node})  deadline={proj_str}  verdict={}({worst_verd_node})",
+        "SUBTREE  all={total_tokens} tok  worst-tok={worst_tokens}({worst_tokens_node})  deadline={proj_str}  verdict={}({worst_verd_node})",
         worst_verd.as_str()
     );
     println!();
@@ -627,8 +578,8 @@ fn print_subtree_summary(pairs: &[(SubtreeInfo, SessionNode)]) {
 
 fn print_flat(sessions: &[SessionNode], thresholds: &Thresholds) {
     println!(
-        "{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} MODEL",
-        "SESSION", "TOKENS", "FILL%", "VERDICT", "AGE", "PROJECT"
+        "{:<16} {:>8}  {:<30}  {:<5}  {:<28} MODEL",
+        "SESSION", "TOKENS", "VERDICT", "AGE", "PROJECT"
     );
     for s in sessions {
         let id = short_id(&s.session_uuid);
@@ -638,10 +589,9 @@ fn print_flat(sessions: &[SessionNode], thresholds: &Thresholds) {
             format!("  [{} sub-agent(s)]", s.children.len())
         };
         println!(
-            "{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} {}{}",
+            "{:<16} {:>8}  {:<30}  {:<5}  {:<28} {}{}",
             id,
             tokens_str(s),
-            fill_str(s, thresholds),
             verdict_str(s, thresholds),
             age_str(s.last_turn_at),
             truncate_project(project_str(s)),
@@ -654,10 +604,9 @@ fn print_flat(sessions: &[SessionNode], thresholds: &Thresholds) {
 fn print_tree(sessions: &[SessionNode], thresholds: &Thresholds) {
     for s in sessions {
         println!(
-            "{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} {}",
+            "{:<16} {:>8}  {:<30}  {:<5}  {:<28} {}",
             short_id(&s.session_uuid),
             tokens_str(s),
-            fill_str(s, thresholds),
             verdict_str(s, thresholds),
             age_str(s.last_turn_at),
             truncate_project(project_str(s)),
@@ -672,11 +621,10 @@ fn print_tree(sessions: &[SessionNode], thresholds: &Thresholds) {
                 .map(short_id)
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {} agent:{:<16} {:>8}  {:>5}  {:<30}  {:<5}  {:<28} {}",
+                "  {} agent:{:<16} {:>8}  {:<30}  {:<5}  {:<28} {}",
                 conn,
                 child_id,
                 tokens_str(child),
-                fill_str(child, thresholds),
                 verdict_str(child, thresholds),
                 age_str(child.last_turn_at),
                 "",
@@ -698,9 +646,7 @@ mod tests {
             project_key: "test-project".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 100_000,
-                fill_percent: 50,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -757,9 +703,7 @@ mod tests {
             project_key: "test-project".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 10_000,
-                fill_percent: 5,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -775,9 +719,7 @@ mod tests {
             window: Some(WindowInfo {
                 // 40k: above ABSOLUTE_WATCH_TOKENS (32k), below ABSOLUTE_RECYCLE_BACKSTOP (128k)
                 window_tokens: 40_000,
-                fill_percent: 20,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -793,11 +735,9 @@ mod tests {
         assert_eq!(jnode.session_id, parent_uuid);
         assert_eq!(jnode.parent_session_id, None);
         assert_eq!(jnode.agent_id, None);
-        assert_eq!(jnode.fill_percent, Some(20));
         // 40k >= ABSOLUTE_WATCH_TOKENS → Nearing via abs-watch gate (ADR-010)
         assert_eq!(jnode.verdict, Some("nearing"));
         assert_eq!(jnode.verdict_gate, Some("absolute_watch"));
-        assert!(jnode.fill_percent <= Some(100));
         assert_eq!(jnode.children.len(), 1);
 
         let child_j = &jnode.children[0];
@@ -821,9 +761,7 @@ mod tests {
             project_key: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 190_000,
-                fill_percent: 95,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -862,9 +800,7 @@ mod tests {
             project_key: "test-project".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 50_000,
-                fill_percent: 25,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -878,9 +814,7 @@ mod tests {
             project_key: "test-project".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 100_000,
-                fill_percent: 50,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -915,7 +849,7 @@ mod tests {
         assert_eq!(retained.len(), 1, "stale must be retained with --session");
     }
 
-    // M1: no-window node must emit null for model, context_limit, window_tokens, fill_percent, verdict.
+    // M1: no-window node must emit null for model, window_tokens, verdict.
     #[test]
     fn test_json_null_fields_when_no_window() {
         let thresholds = Thresholds::default();
@@ -931,13 +865,10 @@ mod tests {
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
         assert_eq!(jnode.model, None);
-        assert_eq!(jnode.context_limit, None);
         assert_eq!(jnode.window_tokens, None);
-        assert_eq!(jnode.fill_percent, None);
         assert_eq!(jnode.verdict, None);
         let json_str = serde_json::to_string(&jnode).unwrap();
         assert!(json_str.contains("\"model\":null"));
-        assert!(json_str.contains("\"context_limit\":null"));
         assert!(json_str.contains("\"verdict\":null"));
     }
 
@@ -947,7 +878,6 @@ mod tests {
         uuid: &str,
         agent_id: Option<&str>,
         tokens: u64,
-        fill: u8,
         projection: Option<u32>,
         velocity: Option<u64>,
     ) -> SessionNode {
@@ -957,9 +887,7 @@ mod tests {
             project_key: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: tokens,
-                fill_percent: fill,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -968,7 +896,7 @@ mod tests {
             trend: projection.map(|p| WindowTrend {
                 points: Vec::new(),
                 velocity_tokens_per_turn: velocity,
-                projected_turns_to_overbound: Some(p),
+                projected_turns_to_recycle: Some(p),
             }),
         }
     }
@@ -981,15 +909,14 @@ mod tests {
             "aaaa0000-0000-0000-0000-000000000001",
             None,
             10_000,
-            5,
             None,
             None,
         );
         let si = compute_subtree(&node, &thresholds);
 
         assert_eq!(si.total_subtree_tokens, 10_000);
-        assert_eq!(si.worst_fill_percent, 5);
-        assert_eq!(si.worst_fill_node, "aaaa0000-0000-0000-0000-000000000001");
+        assert_eq!(si.worst_tokens, 10_000);
+        assert_eq!(si.worst_tokens_node, "aaaa0000-0000-0000-0000-000000000001");
         assert_eq!(si.worst_projection, None);
         assert_eq!(si.worst_projection_node, None);
         assert_eq!(si.max_velocity, None);
@@ -1001,12 +928,11 @@ mod tests {
     fn subtree_multi_level_total_tokens_sum() {
         let thresholds = Thresholds::default();
         let parent_uuid = "pppp0000-0000-0000-0000-000000000000";
-        let mut root = make_node(parent_uuid, None, 50_000, 25, None, None);
+        let mut root = make_node(parent_uuid, None, 50_000, None, None);
         let child_a = make_node(
             parent_uuid,
             Some("aaaa0000-0000-0000-0000-aaaaaaaaaaaa"),
             30_000,
-            15,
             None,
             None,
         );
@@ -1014,7 +940,6 @@ mod tests {
             parent_uuid,
             Some("bbbb0000-0000-0000-0000-bbbbbbbbbbbb"),
             20_000,
-            10,
             None,
             None,
         );
@@ -1024,18 +949,16 @@ mod tests {
         assert_eq!(si.total_subtree_tokens, 100_000); // 50k + 30k + 20k
     }
 
-    // T3: worst-fill selection names the correct node
+    // T3: worst-tokens selection names the correct node
     #[test]
-    fn subtree_worst_fill_names_correct_node() {
+    fn subtree_worst_tokens_names_correct_node() {
         let thresholds = Thresholds::default();
         let parent_uuid = "pppp0000-0000-0000-0000-000000000000";
-        let mut root = make_node(parent_uuid, None, 10_000, 5, None, None);
-        // child_b has higher fill
+        let mut root = make_node(parent_uuid, None, 10_000, None, None);
         let child_a = make_node(
             parent_uuid,
             Some("aaaa0000-0000-0000-0000-aaaaaaaaaaaa"),
             20_000,
-            40,
             None,
             None,
         );
@@ -1043,15 +966,14 @@ mod tests {
             parent_uuid,
             Some("bbbb0000-0000-0000-0000-bbbbbbbbbbbb"),
             80_000,
-            85,
             None,
             None,
         );
         root.children = vec![child_a, child_b];
 
         let si = compute_subtree(&root, &thresholds);
-        assert_eq!(si.worst_fill_percent, 85);
-        assert_eq!(si.worst_fill_node, "bbbb0000-0000-0000-0000-bbbbbbbbbbbb");
+        assert_eq!(si.worst_tokens, 80_000);
+        assert_eq!(si.worst_tokens_node, "bbbb0000-0000-0000-0000-bbbbbbbbbbbb");
     }
 
     // T4: earliest-deadline selection (smallest projection) names the correct node
@@ -1059,12 +981,11 @@ mod tests {
     fn subtree_earliest_projection_names_correct_node() {
         let thresholds = Thresholds::default();
         let parent_uuid = "pppp0000-0000-0000-0000-000000000000";
-        let mut root = make_node(parent_uuid, None, 10_000, 5, Some(20), Some(1_000));
+        let mut root = make_node(parent_uuid, None, 10_000, Some(20), Some(1_000));
         let child_a = make_node(
             parent_uuid,
             Some("aaaa0000-0000-0000-0000-aaaaaaaaaaaa"),
             20_000,
-            10,
             Some(3), // earliest deadline
             Some(5_000),
         );
@@ -1072,7 +993,6 @@ mod tests {
             parent_uuid,
             Some("bbbb0000-0000-0000-0000-bbbbbbbbbbbb"),
             15_000,
-            8,
             Some(12),
             Some(2_000),
         );
@@ -1093,12 +1013,11 @@ mod tests {
         let thresholds = Thresholds::default();
         let parent_uuid = "pppp0000-0000-0000-0000-000000000000";
         // root: 10k tokens → Ok; child_b: 150k → Over (above absolute_recycle_backstop 128k)
-        let mut root = make_node(parent_uuid, None, 10_000, 5, None, None);
+        let mut root = make_node(parent_uuid, None, 10_000, None, None);
         let child_a = make_node(
             parent_uuid,
             Some("aaaa0000-0000-0000-0000-aaaaaaaaaaaa"),
             40_000,
-            20,
             None,
             None,
         );
@@ -1106,7 +1025,6 @@ mod tests {
             parent_uuid,
             Some("bbbb0000-0000-0000-0000-bbbbbbbbbbbb"),
             150_000, // above 128k backstop → Over
-            75,
             None,
             None,
         );
@@ -1128,7 +1046,6 @@ mod tests {
             "ok000000-0000-0000-0000-000000000000",
             None,
             5_000,
-            2,
             None,
             None,
         );
@@ -1136,7 +1053,6 @@ mod tests {
             "near0000-0000-0000-0000-000000000000",
             None,
             40_000, // above watch threshold (32k) → Nearing
-            20,
             None,
             None,
         );
@@ -1144,7 +1060,6 @@ mod tests {
             "over0000-0000-0000-0000-000000000000",
             None,
             150_000, // above backstop (128k) → Over
-            75,
             None,
             None,
         );
@@ -1162,7 +1077,7 @@ mod tests {
                         .unwrap_or(u32::MAX)
                         .cmp(&sb.worst_projection.unwrap_or(u32::MAX))
                 })
-                .then_with(|| sb.worst_fill_percent.cmp(&sa.worst_fill_percent))
+                .then_with(|| sb.worst_tokens.cmp(&sa.worst_tokens))
         });
 
         // Over first, then Nearing, then Ok
@@ -1178,12 +1093,11 @@ mod tests {
         let parent_uuid = "pppp0000-0000-0000-0000-000000000000";
 
         // All nodes lack projection → both fields None
-        let mut root_none = make_node(parent_uuid, None, 1_000, 1, None, None);
+        let mut root_none = make_node(parent_uuid, None, 1_000, None, None);
         root_none.children = vec![make_node(
             parent_uuid,
             Some("cccc0000-0000-0000-0000-cccccccccccc"),
             2_000,
-            1,
             None,
             None,
         )];
@@ -1195,12 +1109,11 @@ mod tests {
         );
 
         // child_a has projection; root and child_b do not
-        let mut root_mixed = make_node(parent_uuid, None, 1_000, 1, None, None);
+        let mut root_mixed = make_node(parent_uuid, None, 1_000, None, None);
         let child_with_proj = make_node(
             parent_uuid,
             Some("aaaa0000-0000-0000-0000-aaaaaaaaaaaa"),
             2_000,
-            1,
             Some(20),
             Some(500),
         );
@@ -1208,7 +1121,6 @@ mod tests {
             parent_uuid,
             Some("bbbb0000-0000-0000-0000-bbbbbbbbbbbb"),
             3_000,
-            1,
             None,
             None,
         );
@@ -1229,9 +1141,9 @@ mod tests {
         );
     }
 
-    // T6c: sort tie-breaker — verdict ties → projection asc → fill desc
+    // T6c: sort tie-breaker — verdict ties → projection asc → tokens desc
     #[test]
-    fn sort_tie_breaker_projection_then_fill() {
+    fn sort_tie_breaker_projection_then_tokens() {
         let thresholds = Thresholds::default();
 
         // Both Ok (5k < watch, projection 7/20 both > PROJECTION_NEARING_TURNS=5).
@@ -1240,7 +1152,6 @@ mod tests {
             "aaaa0000-0000-0000-0000-000000000000",
             None,
             5_000,
-            10,
             Some(7),
             Some(100),
         );
@@ -1248,7 +1159,6 @@ mod tests {
             "bbbb0000-0000-0000-0000-000000000000",
             None,
             5_000,
-            10,
             Some(20),
             Some(100),
         );
@@ -1265,32 +1175,30 @@ mod tests {
                         .unwrap_or(u32::MAX)
                         .cmp(&sb.worst_projection.unwrap_or(u32::MAX))
                 })
-                .then_with(|| sb.worst_fill_percent.cmp(&sa.worst_fill_percent))
+                .then_with(|| sb.worst_tokens.cmp(&sa.worst_tokens))
         });
         assert_eq!(
             pairs[0].1.session_uuid, "aaaa0000-0000-0000-0000-000000000000",
             "earlier projection sorts first"
         );
 
-        // Projection tie (both Some(20)) → higher fill sorts first.
-        let node_fill_high = make_node(
+        // Projection tie (both Some(20)) → higher tokens sorts first.
+        let node_tokens_high = make_node(
             "cccc0000-0000-0000-0000-000000000000",
             None,
-            5_000,
-            80,
+            8_000,
             Some(20),
             Some(100),
         );
-        let node_fill_low = make_node(
+        let node_tokens_low = make_node(
             "dddd0000-0000-0000-0000-000000000000",
             None,
             5_000,
-            10,
             Some(20),
             Some(100),
         );
 
-        let mut pairs2: Vec<(SubtreeInfo, SessionNode)> = vec![node_fill_low, node_fill_high]
+        let mut pairs2: Vec<(SubtreeInfo, SessionNode)> = vec![node_tokens_low, node_tokens_high]
             .into_iter()
             .map(|s| (compute_subtree(&s, &thresholds), s))
             .collect();
@@ -1302,11 +1210,11 @@ mod tests {
                         .unwrap_or(u32::MAX)
                         .cmp(&sb.worst_projection.unwrap_or(u32::MAX))
                 })
-                .then_with(|| sb.worst_fill_percent.cmp(&sa.worst_fill_percent))
+                .then_with(|| sb.worst_tokens.cmp(&sa.worst_tokens))
         });
         assert_eq!(
             pairs2[0].1.session_uuid, "cccc0000-0000-0000-0000-000000000000",
-            "higher fill sorts first when projection ties"
+            "higher tokens sorts first when projection ties"
         );
     }
 
@@ -1315,12 +1223,11 @@ mod tests {
     fn subtree_tokens_saturating_add() {
         let thresholds = Thresholds::default();
         let parent_uuid = "pppp0000-0000-0000-0000-000000000000";
-        let mut root = make_node(parent_uuid, None, u64::MAX, 100, None, None);
+        let mut root = make_node(parent_uuid, None, u64::MAX, None, None);
         let child = make_node(
             parent_uuid,
             Some("cccc0000-0000-0000-0000-cccccccccccc"),
             1_000,
-            5,
             None,
             None,
         );
@@ -1341,9 +1248,7 @@ mod tests {
             project_key: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 100_000,
-                fill_percent: 50,
                 model: "claude-sonnet-4-6".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: Some(0.5),
             }),
@@ -1353,18 +1258,17 @@ mod tests {
                 points: vec![TimelinePoint {
                     at,
                     window_tokens: 100_000,
-                    fill_percent: 50,
                     cache_hit_ratio: Some(0.5),
                 }],
                 velocity_tokens_per_turn: Some(10_000),
-                projected_turns_to_overbound: Some(10),
+                projected_turns_to_recycle: Some(10),
             }),
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
         let t = jnode.trend.as_ref().expect("trend in json node");
         assert_eq!(t.velocity_tokens_per_turn, Some(10_000));
-        assert_eq!(t.projected_turns_to_overbound, Some(10));
+        assert_eq!(t.projected_turns_to_recycle, Some(10));
         assert_eq!(t.points.len(), 1);
         assert_eq!(t.points[0].cache_hit_ratio, Some(0.5));
         let json_str = serde_json::to_string(&jnode).unwrap();

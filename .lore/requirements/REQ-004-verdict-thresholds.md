@@ -18,7 +18,7 @@ related_tests:
 ## Requirement
 
 * The system shall key the verdict off an absolute, model-agnostic effective-budget of active tokens (per ADR-010), not a percentage of the advertised window: ok (below the watch band), nearing -> watch (in measured-degradation territory), and over -> recycle (at or past the recycle backstop).
-* The system shall expose advertised-window fill percentage as a separate capacity-runway readout (distance to forced auto-compaction), not as the verdict basis.
+* The verdict shall combine the absolute watch/backstop bands with the ADR-006 projection (re-targeted to the recycle backstop) and the ADR-008 cache-thrash signal; it shall NOT consult an advertised-window fill percentage or capacity-runway readout (superseded by ADR-011 — the advertised-% nearing/ceiling thresholds and the capacity-runway readout are removed).
 * The system shall make the effective-budget bands configurable (e.g. --watch-tokens / --recycle-backstop), with documented defaults.
 * The system shall surface the verdict per node so an orchestrator can act on individual sub-agents.
 * The verdict shall be advisory only; the system shall never modify a session.

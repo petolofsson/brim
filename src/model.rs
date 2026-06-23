@@ -23,9 +23,7 @@ impl WindowSource {
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
     pub window_tokens: u64,
-    pub fill_percent: u8,
     pub model: String,
-    pub context_limit: u64,
     pub window_source: WindowSource,
     /// cache_read / window_tokens, bounded [0,1]. None when no cache split (ADR-008).
     pub cache_hit_ratio: Option<f32>,
@@ -36,7 +34,6 @@ pub struct WindowInfo {
 pub struct TimelinePoint {
     pub at: DateTime<Utc>,
     pub window_tokens: u64,
-    pub fill_percent: u8,
     pub cache_hit_ratio: Option<f32>,
 }
 
@@ -45,7 +42,7 @@ pub struct TimelinePoint {
 pub struct WindowTrend {
     pub points: Vec<TimelinePoint>,
     pub velocity_tokens_per_turn: Option<u64>,
-    pub projected_turns_to_overbound: Option<u32>,
+    pub projected_turns_to_recycle: Option<u32>,
 }
 
 /// Aggregated health across a node and all its descendants (ADR-007).
@@ -55,11 +52,11 @@ pub struct WindowTrend {
 pub struct SubtreeInfo {
     /// Saturating sum of window_tokens across the subtree.
     pub total_subtree_tokens: u64,
-    /// Fill percent of the fullest node in the subtree.
-    pub worst_fill_percent: u8,
-    /// Node identifier (agent_id if sub-agent, else session_uuid) of the fullest node.
-    pub worst_fill_node: String,
-    /// Smallest projected_turns_to_overbound in the subtree (earliest deadline; worst growth).
+    /// Highest window_tokens of any single node in the subtree.
+    pub worst_tokens: u64,
+    /// Node identifier (agent_id if sub-agent, else session_uuid) of the node with highest tokens.
+    pub worst_tokens_node: String,
+    /// Smallest projected_turns_to_recycle in the subtree (earliest deadline; worst growth).
     /// None when no node in the subtree has projection data.
     pub worst_projection: Option<u32>,
     /// Node owning worst_projection. Invariant: Some iff worst_projection is Some.
@@ -83,11 +80,11 @@ pub fn compute_subtree(node: &SessionNode, thresholds: &Thresholds) -> SubtreeIn
         .unwrap_or(&node.session_uuid)
         .to_string();
 
-    let (self_tokens, self_fill, self_verdict) = if let Some(w) = &node.window {
+    let (self_tokens, self_verdict) = if let Some(w) = &node.window {
         let projected_turns = node
             .trend
             .as_ref()
-            .and_then(|t| t.projected_turns_to_overbound);
+            .and_then(|t| t.projected_turns_to_recycle);
         let (v, _) = absolute_verdict(
             w.window_tokens,
             projected_turns,
@@ -95,20 +92,20 @@ pub fn compute_subtree(node: &SessionNode, thresholds: &Thresholds) -> SubtreeIn
             thresholds.watch_tokens,
             thresholds.recycle_backstop,
         );
-        (w.window_tokens, w.fill_percent, v)
+        (w.window_tokens, v)
     } else {
-        (0, 0, Verdict::Ok)
+        (0, Verdict::Ok)
     };
 
     let self_projection = node
         .trend
         .as_ref()
-        .and_then(|t| t.projected_turns_to_overbound);
+        .and_then(|t| t.projected_turns_to_recycle);
     let self_velocity = node.trend.as_ref().and_then(|t| t.velocity_tokens_per_turn);
 
     let mut total_subtree_tokens = self_tokens;
-    let mut worst_fill_percent = self_fill;
-    let mut worst_fill_node = node_id.clone();
+    let mut worst_tokens = self_tokens;
+    let mut worst_tokens_node = node_id.clone();
     let mut worst_projection = self_projection;
     let mut worst_projection_node = self_projection.map(|_| node_id.clone());
     let mut max_velocity = self_velocity;
@@ -120,9 +117,9 @@ pub fn compute_subtree(node: &SessionNode, thresholds: &Thresholds) -> SubtreeIn
 
         total_subtree_tokens = total_subtree_tokens.saturating_add(ci.total_subtree_tokens);
 
-        if ci.worst_fill_percent > worst_fill_percent {
-            worst_fill_percent = ci.worst_fill_percent;
-            worst_fill_node = ci.worst_fill_node;
+        if ci.worst_tokens > worst_tokens {
+            worst_tokens = ci.worst_tokens;
+            worst_tokens_node = ci.worst_tokens_node;
         }
 
         match (worst_projection, ci.worst_projection) {
@@ -151,8 +148,8 @@ pub fn compute_subtree(node: &SessionNode, thresholds: &Thresholds) -> SubtreeIn
 
     SubtreeInfo {
         total_subtree_tokens,
-        worst_fill_percent,
-        worst_fill_node,
+        worst_tokens,
+        worst_tokens_node,
         worst_projection,
         worst_projection_node,
         max_velocity,
@@ -197,7 +194,7 @@ pub struct RecycleRecommendation {
 ///   2. Among nodes whose OWN self-verdict equals that worst, pick the DEEPEST.
 ///
 /// Tie-break (documented for auditability): projection ASC (None = ∞, no deadline),
-/// fill% DESC (fuller node is more urgent), node_id ASC (lexicographic, final arbiter).
+/// tokens DESC (larger occupancy is more urgent), node_id ASC (lexicographic, final arbiter).
 ///
 /// `is_active_fn` is injected for blast-radius active marking; it may be clock-dependent.
 /// The target selection itself is pure (verdict + tree only) and unit-testable without a clock.
@@ -213,7 +210,7 @@ pub fn recycle_recommendation(
     }
 
     // Walk tree to find deepest node whose own verdict == worst (tie-break documented above).
-    let mut best: Option<(u32, u32, u8, String)> = None; // (depth, proj, fill, node_id)
+    let mut best: Option<(u32, u32, u64, String)> = None; // (depth, proj, tokens, node_id)
     find_target_node(root, thresholds, worst, 0, &mut best);
     let (_, _, _, target_id) = best?;
 
@@ -247,7 +244,7 @@ fn self_verdict(node: &SessionNode, thresholds: &Thresholds) -> (Verdict, Option
         let projected_turns = node
             .trend
             .as_ref()
-            .and_then(|t| t.projected_turns_to_overbound);
+            .and_then(|t| t.projected_turns_to_recycle);
         absolute_verdict(
             w.window_tokens,
             projected_turns,
@@ -275,28 +272,28 @@ fn find_target_node(
     thresholds: &Thresholds,
     target_verdict: Verdict,
     depth: u32,
-    best: &mut Option<(u32, u32, u8, String)>,
+    best: &mut Option<(u32, u32, u64, String)>,
 ) {
     let (v, _) = self_verdict(node, thresholds);
     if v == target_verdict {
         let proj = node
             .trend
             .as_ref()
-            .and_then(|t| t.projected_turns_to_overbound)
+            .and_then(|t| t.projected_turns_to_recycle)
             .unwrap_or(u32::MAX);
-        let fill = node.window.as_ref().map(|w| w.fill_percent).unwrap_or(0);
+        let tokens = node.window.as_ref().map(|w| w.window_tokens).unwrap_or(0);
         let id = node_id_str(node).to_string();
         let is_better = match best.as_ref() {
             None => true,
-            Some((bd, bp, bf, bi)) => {
+            Some((bd, bp, bt, bi)) => {
                 depth > *bd
                     || (depth == *bd && proj < *bp)
-                    || (depth == *bd && proj == *bp && fill > *bf)
-                    || (depth == *bd && proj == *bp && fill == *bf && id < *bi)
+                    || (depth == *bd && proj == *bp && tokens > *bt)
+                    || (depth == *bd && proj == *bp && tokens == *bt && id < *bi)
             }
         };
         if is_better {
-            *best = Some((depth, proj, fill, id));
+            *best = Some((depth, proj, tokens, id));
         }
     }
     for child in &node.children {
@@ -362,9 +359,7 @@ mod tests {
             project_key: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: tokens,
-                fill_percent: ((tokens * 100 / 200_000).min(100)) as u8,
                 model: "m".to_string(),
-                context_limit: 200_000,
                 window_source: WindowSource::LastTurn,
                 cache_hit_ratio: None,
             }),
@@ -522,7 +517,6 @@ mod tests {
     }
 
     // R7: parent and child share the same worst self-verdict (both Over) — depth wins.
-    // Exercises the depth-first tie-break rule that R1 did not reach (R1's leaf was the sole Over).
     #[test]
     fn recycle_depth_wins_when_parent_and_child_both_over() {
         let thresholds = Thresholds::default();
@@ -559,7 +553,7 @@ mod tests {
         soon.trend = Some(WindowTrend {
             points: vec![],
             velocity_tokens_per_turn: None,
-            projected_turns_to_overbound: Some(2),
+            projected_turns_to_recycle: Some(2),
         });
 
         let mut root = mk(root_uuid, None, OK_TOKENS);
@@ -574,17 +568,17 @@ mod tests {
         );
     }
 
-    // R8b: fill-DESC tie-break — sibling with higher fill wins when depth and projection are equal.
+    // R8b: tokens-DESC tie-break — sibling with higher window_tokens wins when depth and projection are equal.
     #[test]
-    fn recycle_tiebreak_fill_desc() {
+    fn recycle_tiebreak_tokens_desc() {
         let thresholds = Thresholds::default();
         let root_uuid = "root0000-0000-0000-0000-000000000000";
         let lo_id = "lo-fill0-0000-0000-0000-000000000000";
         let hi_id = "hi-fill0-0000-0000-0000-000000000000";
 
-        // Both Over, no trend (proj equal at u32::MAX); lo_id fill=75%, hi_id fill=80%.
-        let lo = mk(root_uuid, Some(lo_id), OVER_TOKENS); // 150k/200k = 75%
-        let hi = mk(root_uuid, Some(hi_id), 160_000); // 160k/200k = 80%, still Over
+        // Both Over, no trend (proj equal at u32::MAX); lo_id=150k tokens, hi_id=160k tokens.
+        let lo = mk(root_uuid, Some(lo_id), OVER_TOKENS); // 150k tokens
+        let hi = mk(root_uuid, Some(hi_id), 160_000); // 160k tokens, still Over
 
         let mut root = mk(root_uuid, None, OK_TOKENS);
         root.children = vec![lo, hi]; // lo processed first
@@ -594,7 +588,7 @@ mod tests {
 
         assert_eq!(
             rec.target_node_id, hi_id,
-            "fill-DESC: 80% > 75% at equal depth and projection"
+            "tokens-DESC: 160k > 150k at equal depth and projection"
         );
     }
 
@@ -606,7 +600,7 @@ mod tests {
         let later_id = "bbb00000-0000-0000-0000-000000000000"; // processed first
         let earlier_id = "aaa00000-0000-0000-0000-000000000000"; // smaller lexicographically
 
-        // Both Over, same tokens (equal fill), no trend (equal proj).
+        // Both Over, same tokens, no trend (equal proj).
         let later = mk(root_uuid, Some(later_id), OVER_TOKENS);
         let earlier = mk(root_uuid, Some(earlier_id), OVER_TOKENS);
 

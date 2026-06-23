@@ -4,19 +4,8 @@ use crate::model::{TimelinePoint, WindowInfo, WindowSource, WindowTrend};
 /// Never load more than this many assistant turns per session.
 pub const TREND_TAIL_K: usize = 8;
 
-/// Resolve context-window limit from model string.
-/// Model ids containing "[1m]" map to 1_000_000; all others default to 200_000.
-/// opencode model ids (`z-ai/glm-5.2`, etc.) carry no marker and fall through to the default.
-pub fn window_limit(model: &str) -> u64 {
-    if model.contains("[1m]") {
-        1_000_000
-    } else {
-        200_000
-    }
-}
-
-/// Compute window fill from a usage record (point-in-time or aggregate).
-/// fill = round(window_tokens / limit * 100), bounded to [0, 100].
+/// Compute window occupancy from a usage record (point-in-time or aggregate).
+/// window_tokens = input + cache_read + cache_create (all active tokens in the context window).
 /// cache_hit_ratio = cache_read / window_tokens, bounded [0,1]; None if no cache split.
 pub fn compute_window_info(
     input: u64,
@@ -28,19 +17,10 @@ pub fn compute_window_info(
     let window_tokens = input
         .saturating_add(cache_read)
         .saturating_add(cache_create);
-    let limit = window_limit(model);
-    // Integer round-half-up: (numerator + limit/2) / limit
-    let pct = window_tokens
-        .saturating_mul(100)
-        .saturating_add(limit / 2)
-        .saturating_div(limit)
-        .min(100);
     let cache_hit_ratio = cache_hit_ratio(cache_read, cache_create, window_tokens);
     WindowInfo {
         window_tokens,
-        fill_percent: pct as u8, // safe: bounded to [0, 100] above
         model: model.to_string(),
-        context_limit: limit,
         window_source: source,
         cache_hit_ratio,
     }
@@ -61,13 +41,14 @@ fn cache_hit_ratio(cache_read: u64, cache_create: u64, window_tokens: u64) -> Op
 /// post-reset segment.  A negative delta signals compaction/reset; we discard
 /// the pre-reset segment and compute only over the post-reset tail.
 /// <2 post-reset points → velocity = None.
-/// Projection = (limit − last_window) / velocity when velocity > 0.
-pub fn compute_trend(points: Vec<TimelinePoint>, context_limit: u64) -> WindowTrend {
+/// Projection = (backstop − last_window) / velocity when velocity > 0;
+/// None when current >= backstop (already at or past the recycle backstop).
+pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
     if points.len() < 2 {
         return WindowTrend {
             points,
             velocity_tokens_per_turn: None,
-            projected_turns_to_overbound: None,
+            projected_turns_to_recycle: None,
         };
     }
 
@@ -84,7 +65,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, context_limit: u64) -> WindowTr
         return WindowTrend {
             points,
             velocity_tokens_per_turn: None,
-            projected_turns_to_overbound: None,
+            projected_turns_to_recycle: None,
         };
     }
 
@@ -100,7 +81,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, context_limit: u64) -> WindowTr
         return WindowTrend {
             points,
             velocity_tokens_per_turn: None,
-            projected_turns_to_overbound: None,
+            projected_turns_to_recycle: None,
         };
     }
 
@@ -112,12 +93,12 @@ pub fn compute_trend(points: Vec<TimelinePoint>, context_limit: u64) -> WindowTr
         return WindowTrend {
             points,
             velocity_tokens_per_turn: None,
-            projected_turns_to_overbound: None,
+            projected_turns_to_recycle: None,
         };
     };
     let current = last_pt.window_tokens;
     let projection = {
-        let remaining = context_limit.saturating_sub(current);
+        let remaining = backstop.saturating_sub(current);
         let turns = remaining / velocity; // velocity > 0 (built from positive deltas only)
         Some(turns.min(u32::MAX as u64) as u32)
     };
@@ -125,13 +106,14 @@ pub fn compute_trend(points: Vec<TimelinePoint>, context_limit: u64) -> WindowTr
     WindowTrend {
         points,
         velocity_tokens_per_turn: Some(velocity),
-        projected_turns_to_overbound: projection,
+        projected_turns_to_recycle: projection,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verdict::ABSOLUTE_RECYCLE_BACKSTOP;
     use chrono::TimeZone;
 
     fn ts(hour: u32) -> chrono::DateTime<chrono::Utc> {
@@ -141,11 +123,9 @@ mod tests {
     }
 
     fn pt(hour: u32, window_tokens: u64) -> TimelinePoint {
-        let fill = (window_tokens.min(200_000) * 100 / 200_000) as u8;
         TimelinePoint {
             at: ts(hour),
             window_tokens,
-            fill_percent: fill,
             cache_hit_ratio: None,
         }
     }
@@ -159,11 +139,11 @@ mod tests {
             "claude-sonnet-4-6",
             WindowSource::LastTurn,
         );
-        assert_eq!(info.fill_percent, 100);
+        assert_eq!(info.window_tokens, u64::MAX);
     }
 
     #[test]
-    fn test_window_fill_math_oracle() {
+    fn test_window_tokens_math_oracle() {
         let info = compute_window_info(
             7_000,
             130_000,
@@ -172,39 +152,6 @@ mod tests {
             WindowSource::LastTurn,
         );
         assert_eq!(info.window_tokens, 142_000);
-        assert_eq!(info.fill_percent, 71);
-    }
-
-    #[test]
-    fn test_window_fill_bounded_at_100() {
-        let info = compute_window_info(
-            200_000,
-            100_000,
-            50_000,
-            "claude-sonnet-4-6",
-            WindowSource::LastTurn,
-        );
-        assert_eq!(info.fill_percent, 100);
-    }
-
-    #[test]
-    fn test_window_limit_1m_model() {
-        let info =
-            compute_window_info(500_000, 0, 0, "claude-opus-4-8[1m]", WindowSource::LastTurn);
-        assert_eq!(info.fill_percent, 50);
-    }
-
-    #[test]
-    fn test_context_limit_stored() {
-        let info = compute_window_info(100_000, 0, 0, "claude-sonnet-4-6", WindowSource::LastTurn);
-        assert_eq!(info.context_limit, 200_000);
-    }
-
-    #[test]
-    fn test_glm_default_200k() {
-        let info = compute_window_info(100_000, 0, 0, "z-ai/glm-5.2", WindowSource::LastTurn);
-        assert_eq!(info.context_limit, 200_000);
-        assert_eq!(info.fill_percent, 50);
     }
 
     #[test]
@@ -253,17 +200,15 @@ mod tests {
     fn test_velocity_simple_growth() {
         // Points: 10k, 20k, 30k → deltas: +10k, +10k → velocity = 10k
         let points = vec![pt(0, 10_000), pt(1, 20_000), pt(2, 30_000)];
-        let trend = compute_trend(points, 200_000);
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(trend.velocity_tokens_per_turn, Some(10_000));
-        // projection = (200k - 30k) / 10k = 17
-        assert_eq!(trend.projected_turns_to_overbound, Some(17));
+        // projection = (128k - 30k) / 10k = 9
+        assert_eq!(trend.projected_turns_to_recycle, Some(9));
     }
 
     #[test]
     fn test_velocity_across_reset() {
         // Points: 50k, 80k, 20k (reset!), 30k, 40k
-        // Pre-reset: [50k, 80k] (delta: +30k)
-        // Negative delta at index 2 (20k < 80k) → post_reset_start = 2
         // Post-reset: [20k, 30k, 40k] → deltas: +10k, +10k → velocity = 10k
         let points = vec![
             pt(0, 50_000),
@@ -272,43 +217,54 @@ mod tests {
             pt(3, 30_000),
             pt(4, 40_000),
         ];
-        let trend = compute_trend(points, 200_000);
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(trend.velocity_tokens_per_turn, Some(10_000));
-        // projection = (200k - 40k) / 10k = 16
-        assert_eq!(trend.projected_turns_to_overbound, Some(16));
+        // projection = (128k - 40k) / 10k = 8
+        assert_eq!(trend.projected_turns_to_recycle, Some(8));
     }
 
     #[test]
     fn test_fewer_than_2_post_reset_points_no_velocity() {
         // Reset leaves only 1 post-reset point → velocity = None
         let points = vec![pt(0, 50_000), pt(1, 80_000), pt(2, 10_000)];
-        let trend = compute_trend(points, 200_000);
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         assert!(trend.velocity_tokens_per_turn.is_none());
-        assert!(trend.projected_turns_to_overbound.is_none());
+        assert!(trend.projected_turns_to_recycle.is_none());
     }
 
     #[test]
     fn test_single_point_no_velocity() {
         let points = vec![pt(0, 50_000)];
-        let trend = compute_trend(points, 200_000);
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         assert!(trend.velocity_tokens_per_turn.is_none());
-        assert!(trend.projected_turns_to_overbound.is_none());
+        assert!(trend.projected_turns_to_recycle.is_none());
     }
 
     #[test]
-    fn test_projection_at_overbound() {
-        // current == limit → remaining = 0 → projection = 0
+    fn test_projection_past_backstop_yields_zero() {
+        // current (200k) > backstop (128k) → remaining = 0 → projection = 0
         let points = vec![pt(0, 100_000), pt(1, 200_000)];
-        let trend = compute_trend(points, 200_000);
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(trend.velocity_tokens_per_turn, Some(100_000));
-        assert_eq!(trend.projected_turns_to_overbound, Some(0));
+        assert_eq!(trend.projected_turns_to_recycle, Some(0));
+    }
+
+    #[test]
+    fn test_projection_targets_backstop_not_window() {
+        // Verify projection uses 128k backstop, not any advertised window size.
+        // velocity=10k, current=100k → remaining=128k-100k=28k → turns=2.
+        // (If limit were 200k: remaining=100k → turns=10; backstop gives 2.)
+        let points = vec![pt(0, 90_000), pt(1, 100_000)];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(trend.velocity_tokens_per_turn, Some(10_000));
+        assert_eq!(trend.projected_turns_to_recycle, Some(2)); // 28k/10k=2
     }
 
     #[test]
     fn test_no_positive_deltas_no_velocity() {
         // All deltas are zero or negative (flat then reset)
         let points = vec![pt(0, 50_000), pt(1, 50_000), pt(2, 50_000)];
-        let trend = compute_trend(points, 200_000);
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         // No positive deltas → velocity = None
         assert!(trend.velocity_tokens_per_turn.is_none());
     }
@@ -317,7 +273,7 @@ mod tests {
     fn test_trend_points_preserved() {
         let pts = vec![pt(0, 10_000), pt(1, 20_000)];
         let len = pts.len();
-        let trend = compute_trend(pts, 200_000);
+        let trend = compute_trend(pts, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(trend.points.len(), len);
     }
 }
