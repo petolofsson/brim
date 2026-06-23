@@ -5,10 +5,12 @@ use crate::verdict::{Thresholds, Verdict, VerdictGate, absolute_verdict};
 /// Provenance of the reported window occupancy (REQ-005 machine-readable).
 /// `LastTurn` = computed from the latest point-in-time usage record.
 /// `Aggregate` = fell back to session-aggregate columns (no point-in-time record).
+/// `ProcessLog` = extracted from `CompactionProcessor` lines in process-<pid>.log (REQ-009).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowSource {
     LastTurn,
     Aggregate,
+    ProcessLog,
 }
 
 impl WindowSource {
@@ -16,6 +18,7 @@ impl WindowSource {
         match self {
             WindowSource::LastTurn => "last_turn",
             WindowSource::Aggregate => "aggregate",
+            WindowSource::ProcessLog => "process_log",
         }
     }
 }

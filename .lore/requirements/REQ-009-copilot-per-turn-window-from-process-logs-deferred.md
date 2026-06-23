@@ -1,34 +1,40 @@
 ---
 id: REQ-009
-title: Copilot per-turn window from process logs (deferred)
-status: Draft
+title: Copilot per-turn window from process logs
+status: Accepted
 related_requirements: [REQ-002]
 related_adrs: [ADR-002]
 related_stories: []
 related_tests: []
 ---
 
-# REQ-009 - Copilot per-turn window from process logs (deferred)
+# REQ-009 - Copilot per-turn window from process logs
 
-> **DEFERRED / out of scope for current work.** Records a verified future
-> enhancement and a narrowing note on ADR-002's rationale. No acceptance brim
-> must meet now.
+> Implemented (increment B). brim derives Copilot point-in-time window
+> occupancy from process-log `CompactionProcessor` entries. Format below is
+> VERIFIED-LIVE against a real session.
 
 ## Requirement
 
-- The system MAY (future, deferred — not required now) derive Copilot
-  **point-in-time** window fill and trend by reading
-  `~/.copilot/logs/process-*.log` `CompactionProcessor` entries, which record
-  the running token count of the conversation context **before each model
-  request** — i.e. per-turn occupancy.
-- This per-turn occupancy is **absent from the source brim currently reads**:
+- The system derives Copilot **point-in-time** window fill by reading
+  `~/.copilot/logs/process-<epochMs>-<pid>.log` `CompactionProcessor` entries,
+  which record the running token count of the conversation context **before
+  each model request** — i.e. per-turn occupancy.
+- Per-turn line format (VERIFIED-LIVE):
+  `CompactionProcessor: Utilization <pct>% (<used>/<limit> tokens) below threshold <thresh>%`.
+  brim takes **only `<used>`** as the point-in-time occupancy; `<limit>`,
+  `<pct>`, and `<thresh>` are ignored (absolute-token-only reasoning per
+  ADR-011). The latest occupancy is the last `CompactionProcessor` line in the
+  newest process log for the session.
+- Session ↔ process-log linkage: the log filename embeds `<pid>`; the live
+  session dir holds `inuse.<pid>.lock` with the same pid, tying a session to its
+  process log.
+- This per-turn occupancy is **absent from the source brim formerly relied on**:
   Copilot's `session-state/<id>/events.jsonl` persists only cumulative
   `session.shutdown` metrics. The token-bearing per-turn events
   (`assistant.usage`, `session.shutdown`) are **ephemeral — held in memory for
-  `/usage`, never written to `events.jsonl`** (github/copilot-cli #1394).
-- Therefore brim's current Copilot `window = None` / `trend = None` is
-  **correct for the events.jsonl source**, and this REQ does not change that. It
-  records that per-turn data *does* exist in a different source.
+  `/usage`, never written to `events.jsonl`** (github/copilot-cli #1394). The
+  process log is the only on-disk point-in-time source.
 
 ## Rationale
 
@@ -38,20 +44,16 @@ in the process logs, not the persisted transcript. ADR-002's *decision* still
 stands; only the Copilot-specific justification is narrowed by this finding.
 This REQ is the record of that narrowing — ADR-002 (Accepted) is not edited.
 
-### Why deferred
-
-- New source type: rotating/volatile process logs, unstructured vs. the clean
-  transcript brim reads — higher parse-risk and stability concerns.
-- Would need its own bounded-read policy, validation, and tests before adoption
-  (CODERULES r2-3, r10).
-
 ### Sources
 
 - github/copilot-cli #1394 — usage stats ephemeral, only shown on exit.
-- J-Bax/copilot-token-tracker — parses CompactionProcessor running token count
-  from process logs.
+- tokentopapp/agent-copilot-cli — parses `~/.copilot/logs/process-*.log`
+  `CompactionProcessor` pre-request token counts (point-in-time occupancy).
 
 ## Acceptance Criteria
 
-- [ ] None now — deferred. If adopted, define bounded-read policy, parse
-      validation, and tests before implementation.
+- [x] Read the newest `process-<epochMs>-<pid>.log` for the session and take
+      `<used>` from its last `CompactionProcessor: Utilization ... (<used>/<limit>
+      tokens) ...` line as point-in-time window occupancy.
+- [x] Ignore `<limit>`, `<pct>`, `<thresh>` (absolute-only per ADR-011).
+- [x] Link session to process log via `<pid>` (`inuse.<pid>.lock`).
