@@ -1434,4 +1434,137 @@ mod tests {
         assert!(!json_str.contains("prompt"));
         assert!(!json_str.contains("content"));
     }
+
+    // TEST-005: brim --json node contract matches absolute-tokens field set.
+    #[test]
+    fn test_json_contract_test005() {
+        let thresholds = Thresholds::default();
+        let root_uuid = "00000000-1111-2222-3333-444444444444";
+        let child_agent = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb";
+
+        // no-window child — null fields must be absent (ADR-013 skip-null).
+        let no_window_child = SessionNode {
+            session_uuid: root_uuid.to_string(),
+            agent_id: Some(child_agent.to_string()),
+            project_key: "myproject".to_string(),
+            window: None,
+            children: Vec::new(),
+            last_turn_at: None,
+            trend: None,
+        };
+        // active root with known window_tokens.
+        let root = SessionNode {
+            session_uuid: root_uuid.to_string(),
+            agent_id: None,
+            project_key: "myproject".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 50_000,
+                model: "claude-sonnet-4-6".to_string(),
+                window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
+            }),
+            children: vec![no_window_child],
+            last_turn_at: None,
+            trend: None,
+        };
+
+        let si = compute_subtree(&root, &thresholds);
+        let jroot = to_json_node(&root, &si, None, &thresholds, 30, None);
+        let output = JsonOutput { nodes: vec![jroot] };
+        let json_str = serde_json::to_string(&output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+
+        // (1) top-level: object with `nodes` array, no `generated_at` (ADR-013).
+        assert!(v.is_object());
+        assert!(v["nodes"].is_array());
+        assert!(v.get("generated_at").is_none(), "generated_at absent");
+
+        let root_node = &v["nodes"][0];
+
+        // (2) stable top-level keys present on active windowed node (REQ-005, ADR-012).
+        for key in [
+            "session_id",
+            "project",
+            "model",
+            "window_tokens",
+            "verdict",
+            "window_source",
+            "active",
+            "subtree",
+            "children",
+        ] {
+            assert!(root_node.get(key).is_some(), "root missing key: {key}");
+        }
+        // root has no parent → parent_session_id absent.
+        assert!(root_node.get("parent_session_id").is_none());
+
+        // (3) no limit / fill_percent anywhere (ADR-011 / ADR-012).
+        assert!(!json_str.contains("\"limit\""), "no limit field");
+        assert!(!json_str.contains("fill_percent"), "no fill_percent field");
+
+        // (4) verdict is one of ok / nearing / over_recycle (ADR-012).
+        let verdict = root_node["verdict"].as_str().unwrap();
+        assert!(
+            matches!(verdict, "ok" | "nearing" | "over_recycle"),
+            "verdict={verdict}"
+        );
+
+        // (5) subtree uses short names; verbose names absent (ADR-013).
+        let sub = &root_node["subtree"];
+        for key in [
+            "subtree_tokens",
+            "worst_tokens",
+            "worst_node",
+            "worst_verdict",
+            "worst_verdict_node",
+        ] {
+            assert!(sub.get(key).is_some(), "subtree missing key: {key}");
+        }
+        for key in [
+            "total_subtree_tokens",
+            "worst_tokens_node",
+            "worst_projection",
+            "worst_projection_node",
+        ] {
+            assert!(sub.get(key).is_none(), "verbose subtree key present: {key}");
+        }
+
+        // (6) child carries parent_session_id matching root's session_id (REQ-003).
+        let child_node = &root_node["children"][0];
+        let root_session_id = root_node["session_id"].as_str().unwrap();
+        assert_eq!(
+            child_node
+                .get("parent_session_id")
+                .expect("child carries parent_session_id")
+                .as_str()
+                .unwrap(),
+            root_session_id,
+        );
+        assert_eq!(child_node["agent_id"].as_str().unwrap(), child_agent);
+
+        // no-window child: nullable fields absent (ADR-013 skip-null).
+        for key in [
+            "model",
+            "window_tokens",
+            "verdict",
+            "verdict_gate",
+            "window_source",
+            "last_turn_at",
+            "trend",
+            "recycle_recommendation",
+        ] {
+            assert!(
+                child_node.get(key).is_none(),
+                "null field present on no-window child: {key}"
+            );
+        }
+        // always-present child fields.
+        for key in ["session_id", "project", "active", "subtree", "children"] {
+            assert!(child_node.get(key).is_some(), "child missing key: {key}");
+        }
+
+        // (7) no transcript / prompt content (CODERULES r11).
+        assert!(!json_str.contains("prompt"), "no prompt in output");
+        assert!(!json_str.contains("content"), "no content in output");
+    }
 }
