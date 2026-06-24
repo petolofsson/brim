@@ -41,7 +41,8 @@ fi
 printf '%s' "$v" > "$state_file" 2>/dev/null || true
 
 # REQ-010 + REQ-015: anything other than a fresh transition into 'over' → silent
-if [ "$v" != "over" ] || [ "$prior" = "over" ]; then
+# Literal "over_recycle" comes from src/verdict.rs Verdict::Over as_json_str — keep in sync.
+if [ "$v" != "over_recycle" ] || [ "$prior" = "over_recycle" ]; then
     exit 0
 fi
 

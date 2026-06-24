@@ -40,10 +40,10 @@ occupancy=$(printf '%s' "$tokens" | awk '{printf "%d", ($1 * 100 / 128000)}')
 
 # --- render with colour (SC2059: ANSI vars passed as args, not in format string) ---
 case "$v" in
-    ok)      printf '%sbrim %s%% ok%s\n'      "$GREEN"  "$occupancy" "$RESET" ;;
-    nearing) printf '%sbrim %s%% nearing%s\n' "$YELLOW" "$occupancy" "$RESET" ;;
-    over)    printf '%sbrim %s%% over%s\n'    "$RED"    "$occupancy" "$RESET" ;;
-    *)       printf 'brim %s%% %s\n'          "$occupancy" "$v" ;;
+    ok)           printf '%sbrim %s%% ok%s\n'      "$GREEN"  "$occupancy" "$RESET" ;;
+    nearing)      printf '%sbrim %s%% nearing%s\n' "$YELLOW" "$occupancy" "$RESET" ;;
+    over_recycle) printf '%sbrim %s%% over%s\n'    "$RED"    "$occupancy" "$RESET" ;;
+    *)            printf 'brim %s%% %s\n'          "$occupancy" "$v" ;;
 esac
 
 exit 0
