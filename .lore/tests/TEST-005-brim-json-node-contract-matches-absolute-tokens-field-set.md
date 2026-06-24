@@ -1,7 +1,7 @@
 ---
 id: TEST-005
 title: brim --json node contract matches absolute-tokens field set
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-005
   - FEATURE-001
