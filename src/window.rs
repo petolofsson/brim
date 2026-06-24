@@ -1,4 +1,5 @@
 use crate::model::{TimelinePoint, WindowInfo, WindowSource, WindowTrend};
+use crate::verdict::CACHE_THRASH_THRESHOLD;
 
 /// Bounded tail-read depth for trend computation (ADR-006, REQ-007).
 /// Never load more than this many assistant turns per session.
@@ -7,6 +8,25 @@ pub const TREND_TAIL_K: usize = 8;
 /// Recency window for velocity: max over the last W positive deltas (ADR-022).
 /// Isolated spikes older than W positive-delta turns no longer pin velocity high.
 const VELOCITY_WINDOW_W: usize = TREND_TAIL_K / 2;
+
+/// Consecutive low-rho turns required to conclude sustained cache thrash (ADR-023).
+/// N=3: filters one-off cold-start / large-content dips (a single bad turn is not thrash);
+/// two consecutive turns are borderline; three is clearly a pattern without delaying detection.
+pub const SUSTAINED_THRASH_N: usize = 3;
+
+/// Returns true when the last SUSTAINED_THRASH_N points all have cache_hit_ratio < CACHE_THRASH_THRESHOLD.
+/// Requires every checked point to have a Some ratio (non-cache providers never fire).
+/// Returns false when fewer than SUSTAINED_THRASH_N points exist — the N-turn requirement
+/// is the cold-start guard; no separate tau dependency needed (new ADR).
+pub fn sustained_cache_thrash(points: &[TimelinePoint]) -> bool {
+    if points.len() < SUSTAINED_THRASH_N {
+        return false;
+    }
+    points[points.len() - SUSTAINED_THRASH_N..].iter().all(|p| {
+        p.cache_hit_ratio
+            .is_some_and(|r| r < CACHE_THRASH_THRESHOLD)
+    })
+}
 
 /// Compute window occupancy from a usage record (point-in-time or aggregate).
 /// window_tokens = input + cache_read + cache_create (all active tokens in the context window).
@@ -117,7 +137,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verdict::ABSOLUTE_RECYCLE_BACKSTOP;
+    use crate::verdict::{ABSOLUTE_RECYCLE_BACKSTOP, CACHE_THRASH_THRESHOLD};
     use chrono::TimeZone;
 
     fn ts(hour: u32) -> chrono::DateTime<chrono::Utc> {
@@ -131,6 +151,14 @@ mod tests {
             at: ts(hour),
             window_tokens,
             cache_hit_ratio: None,
+        }
+    }
+
+    fn pt_ratio(hour: u32, window_tokens: u64, ratio: Option<f32>) -> TimelinePoint {
+        TimelinePoint {
+            at: ts(hour),
+            window_tokens,
+            cache_hit_ratio: ratio,
         }
     }
 
@@ -378,5 +406,93 @@ mod tests {
         // deltas: [1k, 10k] → both in last W=4 → max = 10k
         let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(trend.velocity_tokens_per_turn, Some(10_000));
+    }
+
+    // sustained_cache_thrash tests (new ADR)
+
+    #[test]
+    fn test_sustained_thrash_fires_n_consecutive_low() {
+        // N=3 consecutive low-ratio points → true
+        let low = CACHE_THRASH_THRESHOLD - 0.01;
+        let points = vec![
+            pt_ratio(0, 10_000, Some(low)),
+            pt_ratio(1, 10_000, Some(low)),
+            pt_ratio(2, 10_000, Some(low)),
+        ];
+        assert!(sustained_cache_thrash(&points));
+    }
+
+    #[test]
+    fn test_sustained_thrash_no_fire_single_dip() {
+        // Only last 1 of 3 is low — no sustained thrash
+        let low = CACHE_THRASH_THRESHOLD - 0.01;
+        let high = CACHE_THRASH_THRESHOLD + 0.10;
+        let points = vec![
+            pt_ratio(0, 10_000, Some(high)),
+            pt_ratio(1, 10_000, Some(high)),
+            pt_ratio(2, 10_000, Some(low)),
+        ];
+        assert!(!sustained_cache_thrash(&points));
+    }
+
+    #[test]
+    fn test_sustained_thrash_no_fire_fewer_than_n_points() {
+        // Only 2 points (< N=3) → cold-start guard → false
+        let low = CACHE_THRASH_THRESHOLD - 0.01;
+        let points = vec![
+            pt_ratio(0, 10_000, Some(low)),
+            pt_ratio(1, 10_000, Some(low)),
+        ];
+        assert!(!sustained_cache_thrash(&points));
+    }
+
+    #[test]
+    fn test_sustained_thrash_no_fire_healthy_ratio() {
+        // All high ratios → false
+        let high = CACHE_THRASH_THRESHOLD + 0.50;
+        let points = vec![
+            pt_ratio(0, 10_000, Some(high)),
+            pt_ratio(1, 10_000, Some(high)),
+            pt_ratio(2, 10_000, Some(high)),
+        ];
+        assert!(!sustained_cache_thrash(&points));
+    }
+
+    #[test]
+    fn test_sustained_thrash_no_fire_none_ratio() {
+        // None ratio (non-cache provider) → false even with N points
+        let points = vec![
+            pt_ratio(0, 10_000, None),
+            pt_ratio(1, 10_000, None),
+            pt_ratio(2, 10_000, None),
+        ];
+        assert!(!sustained_cache_thrash(&points));
+    }
+
+    #[test]
+    fn test_sustained_thrash_no_fire_at_exact_threshold() {
+        // ratio == CACHE_THRASH_THRESHOLD is NOT strictly less than → false (strict boundary)
+        let at = CACHE_THRASH_THRESHOLD;
+        let points = vec![
+            pt_ratio(0, 10_000, Some(at)),
+            pt_ratio(1, 10_000, Some(at)),
+            pt_ratio(2, 10_000, Some(at)),
+        ];
+        assert!(!sustained_cache_thrash(&points));
+    }
+
+    #[test]
+    fn test_sustained_thrash_checks_last_n_of_longer_series() {
+        // 5 points: first 2 are healthy, last 3 are low → fires (only last N checked)
+        let low = CACHE_THRASH_THRESHOLD - 0.01;
+        let high = CACHE_THRASH_THRESHOLD + 0.50;
+        let points = vec![
+            pt_ratio(0, 10_000, Some(high)),
+            pt_ratio(1, 10_000, Some(high)),
+            pt_ratio(2, 10_000, Some(low)),
+            pt_ratio(3, 10_000, Some(low)),
+            pt_ratio(4, 10_000, Some(low)),
+        ];
+        assert!(sustained_cache_thrash(&points));
     }
 }

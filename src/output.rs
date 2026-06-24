@@ -1,6 +1,7 @@
 use crate::model::{RecycleRecommendation, SessionNode, SubtreeInfo, compute_subtree};
 use crate::parser::short_id;
 use crate::verdict::{Thresholds, Verdict, absolute_verdict};
+use crate::window::sustained_cache_thrash;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -126,14 +127,13 @@ pub(crate) fn to_json_node(
 ) -> JsonNode {
     let (window_tokens, model, verdict, verdict_gate, window_source) =
         if let Some(w) = node.window.as_ref() {
-            let projected_turns = node
-                .trend
-                .as_ref()
-                .and_then(|t| t.projected_turns_to_recycle);
+            let trend = node.trend.as_ref();
+            let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
+            let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
             let (v, gate) = absolute_verdict(
                 w.window_tokens,
                 projected_turns,
-                w.cache_hit_ratio,
+                thrash,
                 thresholds.watch_tokens,
                 thresholds.recycle_backstop,
             );
@@ -250,14 +250,13 @@ pub(crate) fn verdict_str(node: &SessionNode, thresholds: &Thresholds) -> String
     let Some(w) = node.window.as_ref() else {
         return "-".to_string();
     };
-    let projected_turns = node
-        .trend
-        .as_ref()
-        .and_then(|t| t.projected_turns_to_recycle);
+    let trend = node.trend.as_ref();
+    let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
+    let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
     let (v, gate) = absolute_verdict(
         w.window_tokens,
         projected_turns,
-        w.cache_hit_ratio,
+        thrash,
         thresholds.watch_tokens,
         thresholds.recycle_backstop,
     );

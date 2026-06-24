@@ -35,7 +35,7 @@ pub enum VerdictGate {
     AbsoluteWatch,
     /// (b) projected turns to recycle ≤ PROJECTION_NEARING_TURNS
     ProjectionNearing,
-    /// (d) cache_hit_ratio < CACHE_THRASH_THRESHOLD (Nearing only, ADR-008)
+    /// (d) sustained cache_hit_ratio < CACHE_THRASH_THRESHOLD over N consecutive turns (Nearing only, ADR-008/new ADR)
     CacheThrash,
 }
 
@@ -72,16 +72,19 @@ pub const ABSOLUTE_RECYCLE_BACKSTOP: u64 = 128_000;
 
 const PROJECTION_NEARING_TURNS: u32 = 5;
 const PROJECTION_RECYCLE_TURNS: u32 = 2;
-const CACHE_THRASH_THRESHOLD: f32 = 0.20;
+/// Fraction below which cache-read utilisation signals context thrash (ADR-008).
+/// Exposed pub so window::sustained_cache_thrash can use the shared constant.
+pub const CACHE_THRASH_THRESHOLD: f32 = 0.20;
 
 /// Quality verdict: OR of ADR-010 signals (b), (c), (d).
 /// Signal (a) behavioral degradation is deferred per ADR-010.
 /// `watch_tokens` and `recycle_backstop` are runtime-configurable (REQ-004, ADR-010 caveat #1).
+/// `sustained_cache_thrash`: pre-computed by window::sustained_cache_thrash; fires independently of tau.
 /// Returns the verdict and the highest-severity gate that fired.
 pub fn absolute_verdict(
     window_tokens: u64,
     projected_turns: Option<u32>,
-    cache_hit_ratio: Option<f32>,
+    sustained_cache_thrash: bool,
     watch_tokens: u64,
     recycle_backstop: u64,
 ) -> (Verdict, Option<VerdictGate>) {
@@ -99,10 +102,9 @@ pub fn absolute_verdict(
     if projected_turns.is_some_and(|t| t <= PROJECTION_NEARING_TURNS) {
         return (Verdict::Nearing, Some(VerdictGate::ProjectionNearing));
     }
-    // Cache-thrash: ADR-008 corroborating signal (Nearing only).
-    // Guard: suppress at cold start / single-turn (no trend = projected_turns is None).
-    // Full trended falling-fraction signal deferred to ADR-008 follow-up.
-    if projected_turns.is_some() && cache_hit_ratio.is_some_and(|r| r < CACHE_THRASH_THRESHOLD) {
+    // Sustained cache-thrash: rho < theta over N consecutive turns (Nearing only).
+    // Fires independently of tau — N-turn persistence is the cold-start guard.
+    if sustained_cache_thrash {
         return (Verdict::Nearing, Some(VerdictGate::CacheThrash));
     }
     (Verdict::Ok, None)
@@ -137,7 +139,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             10_000,
             None,
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -150,7 +152,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             ABSOLUTE_WATCH_TOKENS,
             None,
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -163,7 +165,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             50_000,
             None,
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -176,7 +178,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             ABSOLUTE_RECYCLE_BACKSTOP,
             None,
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -189,7 +191,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             200_000,
             None,
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -202,7 +204,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             20_000,
             Some(1),
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -215,7 +217,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             20_000,
             Some(PROJECTION_RECYCLE_TURNS),
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -228,7 +230,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             10_000,
             Some(PROJECTION_NEARING_TURNS),
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -238,11 +240,11 @@ mod tests {
 
     #[test]
     fn absolute_verdict_nearing_cache_thrash() {
-        // projected_turns Some (trend present) required for cache-thrash to fire (N1 cold-start guard).
+        // sustained_cache_thrash=true fires Nearing regardless of projected_turns (tau-independent).
         let (v, gate) = absolute_verdict(
             10_000,
-            Some(10),
-            Some(0.10),
+            None,
+            true,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -251,11 +253,26 @@ mod tests {
     }
 
     #[test]
-    fn absolute_verdict_ok_cache_above_threshold() {
+    fn absolute_verdict_cache_thrash_tau_independence() {
+        // tau present (projected_turns=Some) also fires — confirming no dependency on tau.
+        let (v, gate) = absolute_verdict(
+            10_000,
+            Some(10),
+            true,
+            ABSOLUTE_WATCH_TOKENS,
+            ABSOLUTE_RECYCLE_BACKSTOP,
+        );
+        assert_eq!(v, Verdict::Nearing);
+        assert_eq!(gate, Some(VerdictGate::CacheThrash));
+    }
+
+    #[test]
+    fn absolute_verdict_cache_thrash_false_no_fire() {
+        // sustained_cache_thrash=false → Ok; single-turn dips handled by window::sustained_cache_thrash.
         let (v, gate) = absolute_verdict(
             10_000,
             None,
-            Some(0.50),
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -269,7 +286,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             ABSOLUTE_RECYCLE_BACKSTOP,
             Some(1),
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -283,7 +300,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             40_000,
             Some(1),
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -299,7 +316,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             ABSOLUTE_WATCH_TOKENS - 1,
             None,
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -308,12 +325,12 @@ mod tests {
     }
 
     #[test]
-    fn absolute_verdict_cache_thrash_at_exact_threshold() {
-        // ratio == CACHE_THRASH_THRESHOLD → boundary is strict (<), must be Ok
+    fn absolute_verdict_cache_thrash_sustained_false_ok() {
+        // sustained_cache_thrash=false never fires (strict gate — only bool true escalates)
         let (v, gate) = absolute_verdict(
             10_000,
             Some(10),
-            Some(CACHE_THRASH_THRESHOLD),
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -327,7 +344,7 @@ mod tests {
         let (v, gate) = absolute_verdict(
             10_000,
             Some(3),
-            None,
+            false,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
@@ -336,16 +353,16 @@ mod tests {
     }
 
     #[test]
-    fn absolute_verdict_cache_thrash_suppressed_no_trend() {
-        // projected_turns None (cold start / no trend) → cache-thrash suppressed (N1 guard)
+    fn absolute_verdict_absolute_gates_beat_cache_thrash() {
+        // Absolute backstop fires Over even when sustained_cache_thrash=true (absolute wins).
         let (v, gate) = absolute_verdict(
-            10_000,
+            ABSOLUTE_RECYCLE_BACKSTOP,
             None,
-            Some(0.10),
+            true,
             ABSOLUTE_WATCH_TOKENS,
             ABSOLUTE_RECYCLE_BACKSTOP,
         );
-        assert_eq!(v, Verdict::Ok);
-        assert_eq!(gate, None);
+        assert_eq!(v, Verdict::Over);
+        assert_eq!(gate, Some(VerdictGate::AbsoluteBackstop));
     }
 }

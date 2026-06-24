@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::verdict::{Thresholds, Verdict, VerdictGate, absolute_verdict};
+use crate::window::sustained_cache_thrash;
 
 /// Provenance of the reported window occupancy (REQ-005 machine-readable).
 /// `LastTurn` = computed from the latest point-in-time usage record.
@@ -42,19 +43,15 @@ pub struct TimelinePoint {
     #[allow(dead_code)]
     pub at: DateTime<Utc>,
     pub window_tokens: u64,
-    /// Per-turn cache hit ratio. ADR-013: not consumed by the verdict path;
-    /// retained for build-time cache-thrash signal (ADR-008).
-    #[allow(dead_code)]
+    /// Per-turn cache hit ratio; consumed by window::sustained_cache_thrash for the verdict path.
     pub cache_hit_ratio: Option<f32>,
 }
 
 /// Growth trend derived from a bounded tail read of the last K assistant turns (ADR-006).
 #[derive(Debug, Clone)]
 pub struct WindowTrend {
-    /// Per-turn trajectory tail used to derive velocity/projection at build time
-    /// (ADR-006). Not serialized to JSON as of ADR-013 — kept internal for the
-    /// verdict projection; the JSON shape carries only `velocity` + `proj_turns`.
-    #[allow(dead_code)]
+    /// Per-turn trajectory tail; drives velocity/projection (ADR-006) and
+    /// sustained_cache_thrash (new ADR). Not serialized to JSON (ADR-013).
     pub points: Vec<TimelinePoint>,
     pub velocity_tokens_per_turn: Option<u64>,
     pub projected_turns_to_recycle: Option<u32>,
@@ -96,14 +93,13 @@ pub fn compute_subtree(node: &SessionNode, thresholds: &Thresholds) -> SubtreeIn
         .to_string();
 
     let (self_tokens, self_verdict) = if let Some(w) = &node.window {
-        let projected_turns = node
-            .trend
-            .as_ref()
-            .and_then(|t| t.projected_turns_to_recycle);
+        let trend = node.trend.as_ref();
+        let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
+        let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
         let (v, _) = absolute_verdict(
             w.window_tokens,
             projected_turns,
-            w.cache_hit_ratio,
+            thrash,
             thresholds.watch_tokens,
             thresholds.recycle_backstop,
         );
@@ -256,14 +252,13 @@ fn node_id_str(node: &SessionNode) -> &str {
 
 fn self_verdict(node: &SessionNode, thresholds: &Thresholds) -> (Verdict, Option<VerdictGate>) {
     if let Some(w) = &node.window {
-        let projected_turns = node
-            .trend
-            .as_ref()
-            .and_then(|t| t.projected_turns_to_recycle);
+        let trend = node.trend.as_ref();
+        let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
+        let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
         absolute_verdict(
             w.window_tokens,
             projected_turns,
-            w.cache_hit_ratio,
+            thrash,
             thresholds.watch_tokens,
             thresholds.recycle_backstop,
         )

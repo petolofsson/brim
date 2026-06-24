@@ -1,7 +1,7 @@
 ---
 id: ADR-019
 title: Cache-thrash efficiency gate is under-wired as a degradation signal
-status: Accepted
+status: Superseded
 related_requirements: []
 related_adrs:
   - ADR-008
