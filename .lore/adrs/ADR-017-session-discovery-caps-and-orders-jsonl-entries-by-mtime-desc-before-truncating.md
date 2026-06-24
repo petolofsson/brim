@@ -1,7 +1,7 @@
 ---
 id: ADR-017
 title: Session discovery caps and orders .jsonl entries by mtime DESC before truncating
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
 related_adrs: []
