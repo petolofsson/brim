@@ -1,18 +1,18 @@
 ---
 id: STORY-004
 title: Compact brim --json diagnostic output
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-005
   - FEATURE-001
-related_adrs: []
+related_adrs: [ADR-013]
 related_stories: []
 related_tests: []
 ---
 
 # STORY-004 - Compact brim --json diagnostic output
 
-> **Status: Draft — deferred future-work, scheduled 2026-06-24.**
+> **Status: Accepted — shipped 2026-06-24 via ADR-013 (55.3% output reduction).**
 > Out of scope for the completed 4-increment build; recorded now so the lever is not lost.
 
 ## User Story
@@ -46,10 +46,22 @@ not created now.**
 
 ## Acceptance Criteria
 
-- [ ] `brim --json` output is materially smaller than the current ~2000-token baseline.
-- [ ] The largest contributor (`trend.points`) is capped, dropped, or gated behind a flag.
-- [ ] The slimmed schema stays coherent with REQ-005 (or REQ-005 is superseded by a follow-up).
-- [ ] Field-name / null-omission / duplication changes preserve a valid, parseable tree.
+- [x] `brim --json` output is materially smaller than the current ~2000-token baseline.
+- [x] The largest contributor (`trend.points`) is capped, dropped, or gated behind a flag.
+- [x] The slimmed schema stays coherent with REQ-005 (or REQ-005 is superseded by a follow-up).
+- [x] Field-name / null-omission / duplication changes preserve a valid, parseable tree.
+
+## Shipped
+
+STORY-004 shipped via ADR-013: dropped `trend.points` + `generated_at`,
+shortened nested keys (`velocity`, `proj_turns`, `subtree_tokens`,
+`worst_node`, `worst_proj`, `worst_proj_node`, `target`, `node`), and applied
+`#[serde(skip_serializing_if = "Option::is_none")]` to nullable fields.
+Measured on the live tree (opencode.db, 179 nested nodes): 155,304 bytes ->
+69,497 bytes (55.3% reduction); ADR-013's 76-session spec baseline measured
+109,929 -> ~54,638 bytes (50.3%). REQ-005 AC and TEST-005 updated to match.
+Tests: 116/116 green; `cargo fmt --check`, `cargo clippy --all-targets --
+-D warnings` clean.
 
 ## Related
 

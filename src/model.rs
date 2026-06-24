@@ -33,16 +33,28 @@ pub struct WindowInfo {
 }
 
 /// One point in a session's fill trajectory (ADR-006, REQ-007).
+/// ADR-013: not serialized to JSON; the trend JSON shape carries only
+/// `velocity` + `proj_turns`. Retained internally for the verdict projection.
 #[derive(Debug, Clone)]
 pub struct TimelinePoint {
+    /// Timestamp of the turn. ADR-013: not consumed by the verdict path; kept
+    /// for future timeline-emitting flags and for build-time ordering.
+    #[allow(dead_code)]
     pub at: DateTime<Utc>,
     pub window_tokens: u64,
+    /// Per-turn cache hit ratio. ADR-013: not consumed by the verdict path;
+    /// retained for build-time cache-thrash signal (ADR-008).
+    #[allow(dead_code)]
     pub cache_hit_ratio: Option<f32>,
 }
 
 /// Growth trend derived from a bounded tail read of the last K assistant turns (ADR-006).
 #[derive(Debug, Clone)]
 pub struct WindowTrend {
+    /// Per-turn trajectory tail used to derive velocity/projection at build time
+    /// (ADR-006). Not serialized to JSON as of ADR-013 — kept internal for the
+    /// verdict projection; the JSON shape carries only `velocity` + `proj_turns`.
+    #[allow(dead_code)]
     pub points: Vec<TimelinePoint>,
     pub velocity_tokens_per_turn: Option<u64>,
     pub projected_turns_to_recycle: Option<u32>,

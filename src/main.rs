@@ -64,78 +64,95 @@ struct Cli {
     active_mins: u32,
 }
 
-#[derive(Serialize)]
-struct JsonTimelinePoint {
-    at: String,
-    window_tokens: u64,
-    cache_hit_ratio: Option<f32>,
-}
-
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct JsonWindowTrend {
-    points: Vec<JsonTimelinePoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "velocity")]
     velocity_tokens_per_turn: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "proj_turns")]
     projected_turns_to_recycle: Option<u32>,
 }
 
 /// Subtree aggregation over a node + all descendants (ADR-007).
 /// Cost omitted: brim reads point-in-time window only, not cumulative spend (ADR-002).
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct JsonSubtreeInfo {
+    #[serde(rename = "subtree_tokens")]
     total_subtree_tokens: u64,
     worst_tokens: u64,
+    #[serde(rename = "worst_node")]
     worst_tokens_node: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "worst_proj")]
     worst_projection: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "worst_proj_node")]
     worst_projection_node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_velocity: Option<u64>,
     worst_verdict: &'static str,
     worst_verdict_node: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct JsonBlastRadiusEntry {
+    #[serde(rename = "node")]
     node_id: String,
     active: bool,
 }
 
 /// Recycle recommendation in JSON output (ADR-009, REQ-005). Advisory only (ADR-010 §5).
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct JsonRecycleRecommendation {
+    #[serde(rename = "target")]
     target_node_id: String,
     is_root: bool,
     target_verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     verdict_gate: Option<&'static str>,
     blast_radius: Vec<JsonBlastRadiusEntry>,
 }
 
 #[derive(Serialize)]
 struct JsonOutput {
-    generated_at: String,
     nodes: Vec<JsonNode>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct JsonNode {
     session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
     project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     window_tokens: Option<u64>,
     /// Quality verdict: OR of ADR-010 absolute-budget, projection, and cache-thrash signals.
+    #[serde(skip_serializing_if = "Option::is_none")]
     verdict: Option<&'static str>,
     /// Which ADR-010 OR-gate fired (null when verdict is ok).
+    #[serde(skip_serializing_if = "Option::is_none")]
     verdict_gate: Option<&'static str>,
     /// Provenance of the reported window occupancy: "last_turn" or "aggregate" (REQ-005).
+    #[serde(skip_serializing_if = "Option::is_none")]
     window_source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     last_turn_at: Option<String>,
     active: bool,
     /// Per-turn fill trajectory: velocity, projection, cache-hit ratio (ADR-006, ADR-008).
+    /// ADR-013: trend.points (per-turn timeline array) is dropped from JSON output;
+    /// only velocity + proj_turns are serialized.
+    #[serde(skip_serializing_if = "Option::is_none")]
     trend: Option<JsonWindowTrend>,
     /// Subtree aggregation: self + all descendants (ADR-007).
     subtree: JsonSubtreeInfo,
     /// Recycle recommendation for this session tree (ADR-009). Null when subtree is healthy.
     /// Set for root nodes only; null for child nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     recycle_recommendation: Option<JsonRecycleRecommendation>,
     children: Vec<JsonNode>,
 }
@@ -243,15 +260,6 @@ fn to_json_node(
         .to_string();
 
     let trend = node.trend.as_ref().map(|t| JsonWindowTrend {
-        points: t
-            .points
-            .iter()
-            .map(|p| JsonTimelinePoint {
-                at: p.at.to_rfc3339(),
-                window_tokens: p.window_tokens,
-                cache_hit_ratio: p.cache_hit_ratio,
-            })
-            .collect(),
         velocity_tokens_per_turn: t.velocity_tokens_per_turn,
         projected_turns_to_recycle: t.projected_turns_to_recycle,
     });
@@ -375,7 +383,6 @@ fn main() -> Result<()> {
 
     if cli.json {
         let output = JsonOutput {
-            generated_at: Utc::now().to_rfc3339(),
             nodes: pairs
                 .iter()
                 .map(|(si, s)| {
@@ -849,7 +856,7 @@ mod tests {
         assert_eq!(retained.len(), 1, "stale must be retained with --session");
     }
 
-    // M1: no-window node must emit null for model, window_tokens, verdict.
+    // M1: no-window node must skip model, window_tokens, verdict (ADR-013 skip-null).
     #[test]
     fn test_json_null_fields_when_no_window() {
         let thresholds = Thresholds::default();
@@ -868,8 +875,10 @@ mod tests {
         assert_eq!(jnode.window_tokens, None);
         assert_eq!(jnode.verdict, None);
         let json_str = serde_json::to_string(&jnode).unwrap();
-        assert!(json_str.contains("\"model\":null"));
-        assert!(json_str.contains("\"verdict\":null"));
+        // ADR-013: null Option fields are skipped, not emitted as null.
+        assert!(!json_str.contains("\"model\""));
+        assert!(!json_str.contains("\"verdict\""));
+        assert!(!json_str.contains("\"window_tokens\""));
     }
 
     // ADR-007 subtree aggregation tests
@@ -1236,7 +1245,7 @@ mod tests {
         assert_eq!(si.total_subtree_tokens, u64::MAX); // saturated
     }
 
-    // Trend serialized in JSON output when present.
+    // Trend serialized in JSON output when present (ADR-013: no points).
     #[test]
     fn test_json_trend_serialized() {
         use model::{TimelinePoint, WindowTrend};
@@ -1269,10 +1278,160 @@ mod tests {
         let t = jnode.trend.as_ref().expect("trend in json node");
         assert_eq!(t.velocity_tokens_per_turn, Some(10_000));
         assert_eq!(t.projected_turns_to_recycle, Some(10));
-        assert_eq!(t.points.len(), 1);
-        assert_eq!(t.points[0].cache_hit_ratio, Some(0.5));
         let json_str = serde_json::to_string(&jnode).unwrap();
+        // ADR-013: trend serializes velocity + proj_turns only; no points array.
         assert!(json_str.contains("\"trend\""));
-        assert!(json_str.contains("\"velocity_tokens_per_turn\""));
+        assert!(json_str.contains("\"velocity\""));
+        assert!(json_str.contains("\"proj_turns\""));
+        assert!(!json_str.contains("\"points\""));
+        assert!(!json_str.contains("\"velocity_tokens_per_turn\""));
+        // Top-level stability: generated_at dropped (ADR-013).
+        assert!(!json_str.contains("\"generated_at\""));
+    }
+
+    // ADR-013 slim --json contract: full JsonOutput shape.
+    #[test]
+    fn test_json_slim_contract_adr013() {
+        let thresholds = Thresholds::default();
+        let parent_uuid = "aaaabbbb-cccc-dddd-eeee-111122223333";
+        let child_agent = "ffff0000-1111-2222-3333-444455556666";
+
+        // no-window leaf (null fields → skipped)
+        let child = SessionNode {
+            session_uuid: parent_uuid.to_string(),
+            agent_id: Some(child_agent.to_string()),
+            project_key: "p".to_string(),
+            window: None,
+            children: Vec::new(),
+            last_turn_at: None,
+            trend: None,
+        };
+        // root with window + trend (so subtree aggregates and recycle rec populate)
+        let parent = SessionNode {
+            session_uuid: parent_uuid.to_string(),
+            agent_id: None,
+            project_key: "p".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 190_000,
+                model: "claude-sonnet-4-6".to_string(),
+                window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
+            }),
+            children: vec![child],
+            last_turn_at: None,
+            trend: None,
+        };
+
+        let parent_si = compute_subtree(&parent, &thresholds);
+        let rec = recycle_recommendation(&parent, &thresholds, &|_| false)
+            .map(|r| build_json_recycle_rec(&r));
+        let jroot = to_json_node(&parent, &parent_si, None, &thresholds, 30, rec);
+        let output = JsonOutput {
+            nodes: vec![jroot.clone()],
+        };
+        let json_str = serde_json::to_string(&output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).expect("parses");
+
+        // (i) top-level is an object with `nodes` array, no generated_at (ADR-013).
+        assert!(v.get("generated_at").is_none(), "no generated_at");
+        assert!(v.get("nodes").unwrap().is_array(), "nodes array present");
+
+        // (ii) top-level JsonNode keys stay stable (ADR-013: top-level unchanged).
+        let node = &v["nodes"][0];
+        for key in ["session_id", "project", "active", "subtree", "children"] {
+            assert!(node.get(key).is_some(), "root has stable key {key}");
+        }
+        // root window present → window_tokens/verdict/verdict_gate/window_source/model emitted.
+        assert!(node.get("window_tokens").is_some());
+        assert!(node.get("verdict").is_some());
+        assert_eq!(node["verdict"], "over_recycle");
+        assert_eq!(node["verdict_gate"], "absolute_backstop");
+
+        // (iii) nested keys are the short names (ADR-013 rename map).
+        let sub = &node["subtree"];
+        assert!(sub.get("subtree_tokens").is_some(), "subtree_tokens");
+        assert!(sub.get("worst_tokens").is_some(), "worst_tokens");
+        assert!(sub.get("worst_node").is_some(), "worst_node");
+        assert!(sub.get("worst_verdict").is_some(), "worst_verdict");
+        assert!(
+            sub.get("worst_verdict_node").is_some(),
+            "worst_verdict_node"
+        );
+        // worst_proj / worst_proj_node / max_velocity are None here → absent (skip-null).
+        assert!(
+            sub.get("worst_proj").is_none(),
+            "worst_proj skipped when None"
+        );
+        assert!(
+            sub.get("worst_proj_node").is_none(),
+            "worst_proj_node skipped when None"
+        );
+        assert!(
+            sub.get("max_velocity").is_none(),
+            "max_velocity skipped when None"
+        );
+        // verbose names absent
+        assert!(sub.get("total_subtree_tokens").is_none());
+        assert!(sub.get("worst_tokens_node").is_none());
+        assert!(sub.get("worst_projection").is_none());
+        assert!(sub.get("worst_projection_node").is_none());
+
+        // (iv) recycle_recommendation for the over root: target + blast.
+        let rec_v = node
+            .get("recycle_recommendation")
+            .expect("rec emitted for unhealthy root");
+        assert!(
+            rec_v.get("target").is_some(),
+            "target (renamed from target_node_id)"
+        );
+        assert!(
+            rec_v.get("target_node_id").is_none(),
+            "old target_node_id absent"
+        );
+        assert_eq!(rec_v["target"], parent_uuid);
+        let blast = &rec_v["blast_radius"];
+        assert!(blast.is_array());
+        assert!(blast[0].get("node").is_some(), "blast node renamed");
+        assert!(blast[0].get("node_id").is_none(), "old node_id absent");
+
+        // (v) trend has no points key.
+        assert!(
+            node.get("trend").is_none() || node["trend"].get("points").is_none(),
+            "no trend.points"
+        );
+
+        // (vi) null Option fields absent on the no-window child node.
+        let child_v = &node["children"][0];
+        for key in [
+            "model",
+            "window_tokens",
+            "verdict",
+            "verdict_gate",
+            "window_source",
+            "last_turn_at",
+            "trend",
+            "recycle_recommendation",
+        ] {
+            assert!(
+                child_v.get(key).is_none(),
+                "child node skips null field: {key}"
+            );
+        }
+        // child session_id + agent_id + project + active + subtree + children always present.
+        assert!(child_v.get("session_id").is_some());
+        assert!(child_v.get("agent_id").is_some());
+        assert!(child_v.get("project").is_some());
+        assert!(child_v.get("active").is_some());
+        assert!(child_v.get("subtree").is_some());
+
+        // (vii) verdict in {ok,nearing,over_recycle}|null — already checked root verdict.
+        assert!(matches!(
+            node["verdict"].as_str(),
+            Some("ok") | Some("nearing") | Some("over_recycle")
+        ));
+
+        // (viii) no transcript/prompt content.
+        assert!(!json_str.contains("prompt"));
+        assert!(!json_str.contains("content"));
     }
 }
