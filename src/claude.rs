@@ -193,32 +193,53 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
 
     let mut parents: Vec<SessionNode> = Vec::new();
     let mut child_map: HashMap<String, Vec<SessionNode>> = HashMap::new();
-    let mut file_count: usize = 0;
 
-    for entry in entries.flatten() {
+    // Collect .jsonl files, sort newest-first by mtime so the cap retains the most-recent N
+    // sessions. Unreadable mtime sorts last (oldest); filename is a stable tiebreak.
+    let mut jsonl_files: Vec<(std::time::SystemTime, String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str())?.to_string();
+            if path.is_file() && name.ends_with(".jsonl") {
+                let mtime = path
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((mtime, name, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+    jsonl_files.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    jsonl_files.truncate(MAX_FILES_PER_PROJECT);
+
+    for (_, name, path) in jsonl_files {
+        let uuid = name.trim_end_matches(".jsonl").to_string();
+        let (window, last_turn_at, trend) = parse_transcript(&path);
+        parents.push(SessionNode {
+            session_uuid: uuid,
+            agent_id: None,
+            project_key: project_key.clone(),
+            window,
+            children: Vec::new(),
+            last_turn_at,
+            trend,
+        });
+    }
+
+    // Second pass: scan for sub-agent directories (not subject to the file cap).
+    let Ok(entries2) = fs::read_dir(project_dir) else {
+        return parents;
+    };
+    for entry in entries2.flatten() {
         let path = entry.path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
-
-        if path.is_file() && name.ends_with(".jsonl") {
-            if file_count >= MAX_FILES_PER_PROJECT {
-                continue;
-            }
-            file_count += 1;
-            let uuid = name.trim_end_matches(".jsonl").to_string();
-            let (window, last_turn_at, trend) = parse_transcript(&path);
-            parents.push(SessionNode {
-                session_uuid: uuid,
-                agent_id: None,
-                project_key: project_key.clone(),
-                window,
-                children: Vec::new(),
-                last_turn_at,
-                trend,
-            });
-        } else if path.is_dir() {
+        if path.is_dir() {
             let parent_uuid = name.clone();
             let subagents_dir = path.join("subagents");
             if !subagents_dir.is_dir() {
@@ -569,6 +590,158 @@ mod tests {
         assert!(sessions[0].window.is_some());
         // But trend is None (no timestamps → no timeline points)
         assert!(sessions[0].trend.is_none());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // TEST-005-ext: file cap retains newest-N sessions deterministically when count > cap.
+    #[test]
+    fn test_file_cap_retains_newest() {
+        use std::fs::FileTimes;
+        use std::time::{Duration, SystemTime};
+        let tmp = std::env::temp_dir().join("brim_test_file_cap_newest");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let minimal_jsonl = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":10}}}\n";
+
+        // Create MAX_FILES_PER_PROJECT + 5 files with staggered mtimes.
+        // File index i=0 is oldest; i=total-1 is newest.
+        let total = MAX_FILES_PER_PROJECT + 5;
+        let base_time = SystemTime::now();
+        for i in 0..total {
+            let path = tmp.join(format!("{:05}.jsonl", i));
+            fs::write(&path, minimal_jsonl).unwrap();
+            let mtime = base_time - Duration::from_secs((total - i) as u64);
+            let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_times(FileTimes::new().set_modified(mtime)).unwrap();
+        }
+
+        let sessions = discover_project(&tmp);
+        assert_eq!(sessions.len(), MAX_FILES_PER_PROJECT, "cap not applied");
+
+        // The 5 oldest files (indices 0..5) must be dropped; all newer ones retained.
+        let uuids: std::collections::HashSet<_> =
+            sessions.iter().map(|s| s.session_uuid.as_str()).collect();
+        for i in 0..5usize {
+            let name = format!("{:05}", i);
+            assert!(
+                !uuids.contains(name.as_str()),
+                "old file {name} should have been dropped"
+            );
+        }
+        for i in 5..total {
+            let name = format!("{:05}", i);
+            assert!(
+                uuids.contains(name.as_str()),
+                "new file {name} should have been retained"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // Equal-mtime tiebreak: all files share the same mtime; tiebreak is ascending filename.
+    // After cap, the first MAX_FILES_PER_PROJECT alphabetically are retained.
+    // Calling discover_project twice must yield an identical set (total order → deterministic).
+    #[test]
+    fn test_file_cap_equal_mtime_tiebreak() {
+        use std::fs::FileTimes;
+        use std::time::{Duration, SystemTime};
+        let tmp = std::env::temp_dir().join("brim_test_equal_mtime");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let minimal_jsonl = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":10}}}\n";
+
+        let total = MAX_FILES_PER_PROJECT + 5;
+        // A fixed mtime far from now — all files get exactly this value.
+        let fixed_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        for i in 0..total {
+            let path = tmp.join(format!("{i:05}.jsonl"));
+            fs::write(&path, minimal_jsonl).unwrap();
+            let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_times(FileTimes::new().set_modified(fixed_mtime))
+                .unwrap();
+        }
+
+        let sessions = discover_project(&tmp);
+        assert_eq!(sessions.len(), MAX_FILES_PER_PROJECT, "cap not applied");
+
+        // Tiebreak is ascending filename: 00000..00063 retained, 00064..00068 dropped.
+        let uuids: std::collections::HashSet<_> =
+            sessions.iter().map(|s| s.session_uuid.as_str()).collect();
+        for i in 0..MAX_FILES_PER_PROJECT {
+            let name = format!("{i:05}");
+            assert!(
+                uuids.contains(name.as_str()),
+                "file {name} should be retained"
+            );
+        }
+        for i in MAX_FILES_PER_PROJECT..total {
+            let name = format!("{i:05}");
+            assert!(
+                !uuids.contains(name.as_str()),
+                "file {name} should be dropped"
+            );
+        }
+
+        // Stability: repeated call must return the same retained set.
+        let sessions2 = discover_project(&tmp);
+        let uuids2: std::collections::HashSet<_> =
+            sessions2.iter().map(|s| s.session_uuid.as_str()).collect();
+        assert_eq!(
+            uuids, uuids2,
+            "discover_project must be stable across calls"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // UNIX_EPOCH fallback sorts oldest: a file whose mtime is UNIX_EPOCH is dropped first
+    // when total > cap. This exercises the same sort position as the unwrap_or(UNIX_EPOCH)
+    // fallback in discover_project for unreadable mtimes.
+    // Note: forcing metadata() to fail on a readable file is not reliably portable on
+    // Linux/macOS (the OS always returns metadata for an accessible file), so we set the
+    // mtime explicitly to UNIX_EPOCH to cover the equivalent sort behavior.
+    #[test]
+    fn test_file_cap_unix_epoch_sorts_last() {
+        use std::fs::FileTimes;
+        use std::time::SystemTime;
+        let tmp = std::env::temp_dir().join("brim_test_unix_epoch_sort");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let minimal_jsonl = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":10}}}\n";
+
+        let recent_mtime = SystemTime::now();
+        for i in 0..MAX_FILES_PER_PROJECT {
+            let path = tmp.join(format!("recent-{i:05}.jsonl"));
+            fs::write(&path, minimal_jsonl).unwrap();
+            let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_times(FileTimes::new().set_modified(recent_mtime))
+                .unwrap();
+        }
+
+        // One extra file with UNIX_EPOCH mtime — equivalent to unreadable mtime fallback.
+        let epoch_path = tmp.join("epoch-00000.jsonl");
+        fs::write(&epoch_path, minimal_jsonl).unwrap();
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&epoch_path)
+            .unwrap();
+        f.set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+
+        let sessions = discover_project(&tmp);
+        assert_eq!(sessions.len(), MAX_FILES_PER_PROJECT, "cap not applied");
+
+        let uuids: std::collections::HashSet<_> =
+            sessions.iter().map(|s| s.session_uuid.as_str()).collect();
+        assert!(
+            !uuids.contains("epoch-00000"),
+            "UNIX_EPOCH-mtime file must be dropped (sorts oldest)"
+        );
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }
