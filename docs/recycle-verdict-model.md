@@ -189,7 +189,15 @@ Three independent validation sources were obtained; an honest gap remains.
 
 ### Outstanding
 
-- Internal end-to-end code trace (provider feed → aggregation → call-site
-  confirming the single-session model is the actual per-node path) was NOT
-  completed this session. Fidelity is corroborated indirectly by the two
-  independent reimplementations above, but the internal trace remains TODO.
+- Internal end-to-end code trace (provider feed → aggregation → call-site)
+  **COMPLETED**. Model fidelity is **CONFIRMED** as the actual per-node decision
+  path:
+  - **Area 2 — aggregation (97/100):** verdict is computed per-node via
+    `absolute_verdict`; no roll-up alters a node's own verdict.
+  - **Area 3 — call-site (92/100):** `compute_window_info` → `compute_trend` →
+    `absolute_verdict` is wired exactly; thresholds come from the CLI only, and
+    nothing mutates the verdict after computation.
+  - **Area 1 — provider feed (88/100):** surfaced one bug —
+    `projected_turns_to_recycle` was computed against the hardcoded 128k backstop
+    instead of the configurable `--recycle-backstop` (REQ-004) at `claude.rs:170`,
+    `codex.rs:338`, `opencode.rs:366`, `copilot.rs:134`. Fixed in a separate commit.

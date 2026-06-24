@@ -1,7 +1,7 @@
 ---
 id: ADR-019
 title: Cache-thrash efficiency gate is under-wired as a degradation signal
-status: Draft
+status: Accepted
 related_requirements: []
 related_adrs:
   - ADR-008
@@ -45,11 +45,20 @@ trigger imports that noise into the verdict.
 
 ## Decision
 
-*(Proposed, NOT finalized — decision pending; this ADR stays Draft until a human
-chooses an option.)*
+**Accepted outcome — (c) keep current / DEFER.** `cache_hit_ratio` (`ρ`) stays a
+**corroborating, `Nearing`-only signal**, wired exactly as ADR-008 left it: it does
+**NOT** fire independently of `τ`, and it is **NOT** a co-equal `Over` trigger. The
+proxy is too noisy to carry breach-grade escalation alone — legitimate low-ratio
+turns exist (cold-start, large new-content) and token economics ≠ reasoning quality
+(addendum scope-boundary A). Growth (ADR-010 / ADR-011 / ADR-018) remains the
+load-bearing primary signal.
 
-Decide how much authority to give the `cache_hit_ratio` thrash gate, weighing the
-"primary degradation signal" goal against the proxy's noisiness. Candidate options:
+**Strengthening is DEFERRED**, not rejected: option (b) sustained-thrash (`ρ < θ`
+over N consecutive turns — a trended falling-fraction) is the preferred path **if
+and when** a less-noisy signal is available. Until then no code change is made; the
+"deferred to ADR-008 follow-up" note in `absolute_verdict` remains accurate.
+
+The options weighed before this decision:
 
 - **(a) Let `ρ` fire independently of `τ`.** Drop the `projected_turns.is_some()`
   guard so a low ratio escalates even with no trend (closes the cold-start silence).
@@ -66,11 +75,11 @@ Decide how much authority to give the `cache_hit_ratio` thrash gate, weighing th
   **acceptable outcome** given the proxy's weakness — a noisy proxy is a poor sole
   basis for escalation, and growth remains the load-bearing primary signal.
 
-**Recommendation (open):** lean **(b) sustained thrash**, else **(c) defer**. Do
-**NOT** make `ρ` a co-equal `Over` trigger — the proxy is too noisy (legitimate
-low-ratio turns exist, and token economics ≠ reasoning quality) to carry a breach-
-grade escalation on its own. The choice is left **OPEN for human decision**; this
-ADR remains Draft.
+**Decision: (c) defer/keep-current** — accepted as above. `ρ` does **NOT** become a
+co-equal `Over` trigger and does **NOT** fire independently of `τ`; the proxy is too
+noisy (legitimate low-ratio turns exist, and token economics ≠ reasoning quality) to
+carry breach-grade escalation on its own. Strengthening to (b) sustained-thrash is
+deferred pending a less-noisy signal.
 
 ## Consequences
 

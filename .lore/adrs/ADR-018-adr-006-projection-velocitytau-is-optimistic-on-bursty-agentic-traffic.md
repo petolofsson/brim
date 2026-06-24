@@ -1,7 +1,7 @@
 ---
 id: ADR-018
 title: ADR-006 projection (velocity/tau) is optimistic on bursty agentic traffic
-status: Draft
+status: Accepted
 related_requirements: []
 related_adrs:
   - ADR-006
@@ -118,10 +118,11 @@ this ADR remains Draft.
 ## Supersession
 
 This ADR does **NOT** edit the Accepted ADR-006, ADR-010, or ADR-011 (recorded
-here per the never-edit-an-Accepted-ADR rule). **If and when Accepted**, it
-supersedes only **ADR-006's velocity/projection clause** (the
-median-of-positive-deltas estimator and its projective contribution) per whichever
-option is chosen. The ADR-006 bounded-tail read, negative-delta reset detection,
+here per the never-edit-an-Accepted-ADR rule). **Now Accepted, this ADR actively
+supersedes** **ADR-006's velocity/projection clause** (the
+median-of-positive-deltas estimator and its projective contribution) per the
+accepted option — (a) high-quantile (p90) estimator complemented by (b) the
+single-large-delta headroom guard. The ADR-006 bounded-tail read, negative-delta reset detection,
 and `None`-with-<2-points degradation are otherwise intact, as is ADR-011's
 re-targeting of the projection to the absolute backstop and the ADR-010 absolute
 OR-gate.
