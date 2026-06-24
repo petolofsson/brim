@@ -6,8 +6,8 @@
 Exact to `src/window.rs` (`compute_window_info`, `compute_trend`) and
 `src/verdict.rs` (`absolute_verdict`, constants), per ADR-006 (projection),
 ADR-008 (cache signal), ADR-010 (OR-gate + 32k/128k anchors), ADR-011
-(absolute tokens only — no advertised-window lookup), REQ-004 (configurable
-thresholds), REQ-005 (JSON contract).
+(absolute tokens only — no advertised-window lookup), ADR-021 (velocity = max,
+no headroom gate), REQ-004 (configurable thresholds), REQ-005 (JSON contract).
 
 ## Definitions
 
@@ -45,20 +45,25 @@ $$s = \max\Big(\{1\} \cup \{\, k \in [2,n] : w_k < w_{k-1} \,\}\Big)$$
 (index of the post-compaction floor; $1$ if no reset). Post-reset segment:
 $P = (w_{s}, \dots, w_n)$.
 
-**Velocity.** From positive consecutive deltas of $P$:
+**Velocity.** The **maximum** of positive consecutive deltas of $P$ (ADR-021,
+superseding ADR-018's p90 and ADR-006's upper-median):
 
 $$D^+ = \big(\, w_{k} - w_{k-1} \ :\ s < k \le n,\ w_k > w_{k-1} \,\big)$$
 
 $$
 v =
 \begin{cases}
-\operatorname{med}^{+}(D^+) & |P| \ge 2 \ \wedge\ D^+ \neq \varnothing \\
+\max(D^+) & |P| \ge 2 \ \wedge\ D^+ \neq \varnothing \\
 \varnothing & \text{otherwise}
 \end{cases}
 $$
 
-$\operatorname{med}^{+}$ = **upper median**: sort $D^+$ ascending $d_{(1)}\le\dots\le d_{(m)}$,
-take $d_{(\lfloor m/2\rfloor + 1)}$ (zero-based index $\lfloor m/2\rfloor$).
+`max` is the deliberate pessimistic estimator: an advisory should err early on
+bursts. At $K = 8$ the positive-delta vector has length $\le 7$, so a nearest-rank
+p90 would collapse to this same last order statistic — `max` *is* what p90 denotes
+in brim's regime (ADR-021). Trade-off: an isolated large delta keeps $v$ high for
+up to $K = 8$ turns until it scrolls off the tail — sticky over-warning, accepted
+for an advisory that sits before the host's hard backstop.
 
 **Projection** (turns to recycle backstop $B$); $\dot\div$ = integer division,
 $a \mathbin{\dot-} b = \max(0, a-b)$ (saturating):
@@ -77,6 +82,9 @@ Note $w_n \ge B \Rightarrow \tau = 0$.
 
 Computed in `absolute_verdict` (`src/verdict.rs`). Per ADR-011 the verdict keys
 entirely off absolute tokens — no advertised-window fill ratio is consulted.
+The OR-gate has **5 gates**; ADR-021 dropped ADR-018's proposed headroom guard
+(dead by construction once $v = \max$, always preempted by the projection-recycle
+gate).
 
 Parameters: watch $T_w = 32{,}000$, backstop $B = 128{,}000$,
 $\tau_R = 2$, $\tau_N = 5$, cache floor $\theta = 0.20$.

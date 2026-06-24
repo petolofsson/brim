@@ -1,7 +1,7 @@
 ---
 id: ADR-018
 title: ADR-006 projection (velocity/tau) is optimistic on bursty agentic traffic
-status: Accepted
+status: Superseded
 related_requirements: []
 related_adrs:
   - ADR-006

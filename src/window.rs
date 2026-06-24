@@ -35,11 +35,11 @@ fn cache_hit_ratio(cache_read: u64, cache_create: u64, window_tokens: u64) -> Op
     Some((cache_read as f32 / window_tokens as f32).clamp(0.0, 1.0))
 }
 
-/// Derive velocity and projection from a bounded per-turn timeline (ADR-006).
+/// Derive velocity and projection from a bounded per-turn timeline (ADR-006, ADR-021).
 ///
-/// Velocity = median of consecutive positive window-token deltas in the
-/// post-reset segment.  A negative delta signals compaction/reset; we discard
-/// the pre-reset segment and compute only over the post-reset tail.
+/// Velocity = MAX of consecutive positive window-token deltas in the post-reset segment.
+/// A negative delta signals compaction/reset; we discard the pre-reset segment and
+/// compute only over the post-reset tail.
 /// <2 post-reset points → velocity = None.
 /// Projection = (backstop − last_window) / velocity when velocity > 0;
 /// None when current >= backstop (already at or past the recycle backstop).
@@ -85,9 +85,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
         };
     }
 
-    pos_deltas.sort_unstable();
-    // Upper-median for even-length arrays (slightly pessimistic — earlier warning).
-    let velocity = pos_deltas[pos_deltas.len() / 2];
+    let velocity = *pos_deltas.iter().max().unwrap();
 
     let Some(last_pt) = post_reset.last() else {
         return WindowTrend {
@@ -275,5 +273,48 @@ mod tests {
         let len = pts.len();
         let trend = compute_trend(pts, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(trend.points.len(), len);
+    }
+
+    // ADR-021: velocity == max delta on a spiky trace.
+    // Canonical trace: 7x+100 then +79,400 → w_n=120k (8k from 128k backstop).
+    // velocity = max([100,100,100,100,100,100,100,79400]) = 79400 → tau=0 → Over (projection_recycle).
+    #[test]
+    fn test_velocity_uses_max_delta() {
+        let mut points = vec![pt(0, 0)];
+        for i in 1..=7u32 {
+            points.push(pt(i, (i as u64) * 100));
+        }
+        points.push(pt(8, 700 + 79_400)); // w_n = 80_100; with start=40k → w_n=120k
+        // Shift all to start at 40k so w_n lands at 120k (the ADR scenario).
+        let points: Vec<_> = points
+            .into_iter()
+            .map(|mut p| {
+                p.window_tokens += 40_000;
+                p
+            })
+            .collect();
+        // w_n = 40_000 + 80_100 = 120_100
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        // max of [100,100,100,100,100,100,100,79400] = 79400
+        assert_eq!(trend.velocity_tokens_per_turn, Some(79_400));
+        // tau = (128000 - 120100) / 79400 = 7900 / 79400 = 0 → projection_recycle
+        assert_eq!(trend.projected_turns_to_recycle, Some(0));
+    }
+
+    // velocity picks single delta when only one positive delta.
+    #[test]
+    fn test_velocity_single_delta() {
+        let points = vec![pt(0, 10_000), pt(1, 50_000)];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(trend.velocity_tokens_per_turn, Some(40_000));
+    }
+
+    // velocity picks larger delta when two positive deltas.
+    #[test]
+    fn test_velocity_picks_max_of_two_deltas() {
+        let points = vec![pt(0, 10_000), pt(1, 11_000), pt(2, 21_000)];
+        // deltas: [1k, 10k] → max = 10k
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(trend.velocity_tokens_per_turn, Some(10_000));
     }
 }
