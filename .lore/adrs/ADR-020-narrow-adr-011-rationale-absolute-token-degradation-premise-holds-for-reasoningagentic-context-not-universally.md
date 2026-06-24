@@ -1,7 +1,7 @@
 ---
 id: ADR-020
 title: "Narrow ADR-011 rationale: absolute-token degradation premise holds for reasoning/agentic context, not universally"
-status: Draft
+status: Accepted
 related_requirements: []
 related_adrs: [ADR-011]
 related_stories: []
