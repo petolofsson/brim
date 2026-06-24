@@ -41,18 +41,14 @@ impl CopilotProvider {
 
 impl Provider for CopilotProvider {
     fn is_available(&self) -> bool {
-        self.state_root().exists() || self.log_root().exists()
+        self.state_root().exists()
     }
 
     fn load_sessions(&self, backstop: u64) -> Vec<SessionNode> {
         if !self.is_available() {
             return Vec::new();
         }
-        let state_root = self.state_root();
-        if !state_root.exists() {
-            return Vec::new();
-        }
-        collect_sessions(&state_root, &self.log_root(), backstop)
+        collect_sessions(&self.state_root(), &self.log_root(), backstop)
     }
 }
 
@@ -460,6 +456,31 @@ mod tests {
         };
         assert!(!p.is_available());
         assert!(p.load_sessions(ABSOLUTE_RECYCLE_BACKSTOP).is_empty());
+    }
+
+    #[test]
+    fn test_copilot_logs_only_not_available() {
+        let tmp =
+            std::env::temp_dir().join(format!("brim_copilot_logsonly_{}", std::process::id()));
+        let log_root = tmp.join(".copilot").join("logs");
+        std::fs::create_dir_all(&log_root).unwrap();
+        // session-state absent → not available despite logs/ existing
+        let p = CopilotProvider { home: tmp.clone() };
+        assert!(!p.is_available());
+        assert!(p.load_sessions(ABSOLUTE_RECYCLE_BACKSTOP).is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_copilot_state_root_only_is_available() {
+        let tmp =
+            std::env::temp_dir().join(format!("brim_copilot_stateonly_{}", std::process::id()));
+        let state_root = tmp.join(".copilot").join("session-state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        // logs/ absent — must not prevent availability
+        let p = CopilotProvider { home: tmp.clone() };
+        assert!(p.is_available());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
