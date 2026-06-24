@@ -7,6 +7,7 @@ related_requirements:
   - REQ-008
 related_adrs:
   - ADR-005
+  - ADR-012
 related_stories: []
 related_tests: []
 ---
@@ -22,8 +23,9 @@ Covered by `src/opencode.rs::tests`. Cases:
    `{ input: 106, cache: { read: 46720, write: 0 } }` and `data.time` matches
    the part row's `time_created`.
 2. **Aggregate fallback.** Same schema; a `session` row with
-   `tokens_input=5000, tokens_cache_read=30000, tokens_cache_write=0` and a
-   non-step-finish `part` (must not be picked up by the oracle).
+   `tokens_input=5000, tokens_cache_read=30000, tokens_cache_write=0,
+   tokens_output=2000` and a non-step-finish `part` (must not be picked
+   up by the oracle).
 3. **Step-finish preferred over aggregate.** A session with large aggregate
    columns but a small step-finish part — the step-finish window must win.
 4. **parent_id sub-agent tree.** Two `session` rows where the second's
@@ -42,17 +44,19 @@ Covered by `src/opencode.rs::tests`. Cases:
 
 ## Expected Result
 
-For case 1: `window_tokens = 46826` (106 + 46720 + 0, saturating add),
-`fill_percent = round(46826 / 200000 * 100) = 23` (bounded [0,100]),
-`context_limit = 200000`, `window_source = LastTurn`, and `last_turn_at` is
-populated from the part's `time_created`.
+For case 1: `window_tokens = 46_826` (106 + 46_720 + 0, saturating add),
+`window_source = LastTurn`, and `last_turn_at` is populated from the part's
+`time_created`. No `fill_percent` or `context_limit` is emitted (ADR-011 /
+ADR-012 — brim reasons in absolute tokens only).
 
-For case 2: `window_tokens = 35000` (5000 + 30000 + 0),
-`fill_percent = round(35000 / 200000 * 100) = 18`,
+For case 2: `window_tokens = 37_000` (5000 + 30_000 + 0 + 2000),
 `window_source = Aggregate` — provenance distinguishes cumulative from
-point-in-time (ADR-002).
+point-in-time (ADR-002). The aggregate path counts `tokens_output` in
+occupancy (per the comment at src/opencode.rs:526 and the dedicated
+assertion in `test_opencode_aggregate_output_counted` at
+src/opencode.rs:533-535).
 
-For case 3: `window_tokens = 46826` and `window_source = LastTurn` — step-finish
+For case 3: `window_tokens = 46_826` and `window_source = LastTurn` — step-finish
 overrides the larger aggregate.
 
 For case 4: one root node with `session_uuid = parent_ses` and one child whose

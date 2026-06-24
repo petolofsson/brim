@@ -11,9 +11,10 @@ related_requirements:
 related_adrs:
   - ADR-001
   - ADR-003
-related_stories: []
+related_stories: [STORY-006]
 related_tests:
   - TEST-001
+  - TEST-005
 ---
 
 # ADR-002 - Point-in-time window over cumulative aggregate
