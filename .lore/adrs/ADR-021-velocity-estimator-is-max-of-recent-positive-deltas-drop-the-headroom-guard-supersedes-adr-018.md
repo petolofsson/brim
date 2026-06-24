@@ -1,7 +1,7 @@
 ---
 id: ADR-021
 title: Velocity estimator is max of recent positive deltas; drop the headroom guard (supersedes ADR-018)
-status: Accepted
+status: Superseded
 related_requirements: []
 related_adrs:
   - ADR-018

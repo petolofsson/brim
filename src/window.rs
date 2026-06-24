@@ -4,6 +4,10 @@ use crate::model::{TimelinePoint, WindowInfo, WindowSource, WindowTrend};
 /// Never load more than this many assistant turns per session.
 pub const TREND_TAIL_K: usize = 8;
 
+/// Recency window for velocity: max over the last W positive deltas (ADR-022).
+/// Isolated spikes older than W positive-delta turns no longer pin velocity high.
+const VELOCITY_WINDOW_W: usize = TREND_TAIL_K / 2;
+
 /// Compute window occupancy from a usage record (point-in-time or aggregate).
 /// window_tokens = input + cache_read + cache_create (all active tokens in the context window).
 /// cache_hit_ratio = cache_read / window_tokens, bounded [0,1]; None if no cache split.
@@ -35,9 +39,10 @@ fn cache_hit_ratio(cache_read: u64, cache_create: u64, window_tokens: u64) -> Op
     Some((cache_read as f32 / window_tokens as f32).clamp(0.0, 1.0))
 }
 
-/// Derive velocity and projection from a bounded per-turn timeline (ADR-006, ADR-021).
+/// Derive velocity and projection from a bounded per-turn timeline (ADR-006, ADR-022).
 ///
-/// Velocity = MAX of consecutive positive window-token deltas in the post-reset segment.
+/// Velocity = MAX of the most recent VELOCITY_WINDOW_W consecutive positive deltas
+/// in the post-reset segment (windowed max — ADR-022 refinement over ADR-021 global max).
 /// A negative delta signals compaction/reset; we discard the pre-reset segment and
 /// compute only over the post-reset tail.
 /// <2 post-reset points → velocity = None.
@@ -85,7 +90,8 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
         };
     }
 
-    let velocity = *pos_deltas.iter().max().unwrap();
+    let w_start = pos_deltas.len().saturating_sub(VELOCITY_WINDOW_W);
+    let velocity = *pos_deltas[w_start..].iter().max().unwrap();
 
     let Some(last_pt) = post_reset.last() else {
         return WindowTrend {
@@ -275,30 +281,86 @@ mod tests {
         assert_eq!(trend.points.len(), len);
     }
 
-    // ADR-021: velocity == max delta on a spiky trace.
-    // Canonical trace: 7x+100 then +79,400 → w_n=120k (8k from 128k backstop).
-    // velocity = max([100,100,100,100,100,100,100,79400]) = 79400 → tau=0 → Over (projection_recycle).
+    // ADR-022: windowed max — spike at turn T, 4 small-delta turns after → velocity drops.
+    // Canonical trace: 9 points total. First 8 deltas are small (+100 each), last 1 is the spike (+79400).
+    // That's the "burst just happened" case: spike IS in last W=4 positive deltas → velocity = 79400.
     #[test]
-    fn test_velocity_uses_max_delta() {
-        let mut points = vec![pt(0, 0)];
+    fn test_velocity_burst_just_happened_still_over() {
+        // 9 points: t0..t8; deltas d0..d7 = [100,100,100,100,100,100,100,79400]
+        // spike is d7 (most recent) → in last W=4 window → velocity = 79400
+        let mut points = vec![pt(0, 40_000)];
         for i in 1..=7u32 {
-            points.push(pt(i, (i as u64) * 100));
+            points.push(pt(i, 40_000 + (i as u64) * 100));
         }
-        points.push(pt(8, 700 + 79_400)); // w_n = 80_100; with start=40k → w_n=120k
-        // Shift all to start at 40k so w_n lands at 120k (the ADR scenario).
-        let points: Vec<_> = points
-            .into_iter()
-            .map(|mut p| {
-                p.window_tokens += 40_000;
-                p
-            })
-            .collect();
-        // w_n = 40_000 + 80_100 = 120_100
+        points.push(pt(8, 40_700 + 79_400)); // w_n = 120_100
         let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
-        // max of [100,100,100,100,100,100,100,79400] = 79400
         assert_eq!(trend.velocity_tokens_per_turn, Some(79_400));
-        // tau = (128000 - 120100) / 79400 = 7900 / 79400 = 0 → projection_recycle
+        // tau = (128000 - 120100) / 79400 = 0 → Over
         assert_eq!(trend.projected_turns_to_recycle, Some(0));
+    }
+
+    // ADR-022: isolated spike aged out after W=4 subsequent positive-delta turns.
+    // Trace (K=8 tail): spike at d2, then 4 small positive deltas d3..d6.
+    // Last W=4 positive deltas = [d3,d4,d5,d6] = [100,100,100,100] → velocity = 100.
+    #[test]
+    fn test_isolated_spike_decays_after_w_turns() {
+        // 8 points → 7 deltas: d0=100, d1=100, d2=79400(spike), d3=100, d4=100, d5=100, d6=100
+        let base = 10_000u64;
+        let points = vec![
+            pt(0, base),
+            pt(1, base + 100),
+            pt(2, base + 200),
+            pt(3, base + 200 + 79_400), // spike
+            pt(4, base + 200 + 79_400 + 100),
+            pt(5, base + 200 + 79_400 + 200),
+            pt(6, base + 200 + 79_400 + 300),
+            pt(7, base + 200 + 79_400 + 400),
+        ];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        // last W=4 pos deltas: [d3,d4,d5,d6] = [100,100,100,100] → velocity = 100
+        assert_eq!(trend.velocity_tokens_per_turn, Some(100));
+    }
+
+    // ADR-022: sustained burst — all recent deltas large → velocity stays high.
+    // 8 points, all deltas = 5000 → last W=4 are all 5000 → velocity = 5000.
+    #[test]
+    fn test_sustained_burst_velocity_stays_high() {
+        let points = vec![
+            pt(0, 10_000),
+            pt(1, 15_000),
+            pt(2, 20_000),
+            pt(3, 25_000),
+            pt(4, 30_000),
+            pt(5, 35_000),
+            pt(6, 40_000),
+            pt(7, 45_000),
+        ];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(trend.velocity_tokens_per_turn, Some(5_000));
+        // tau = (128k - 45k) / 5k = 83k/5k = 16 → Nearing range
+        assert_eq!(trend.projected_turns_to_recycle, Some(16));
+    }
+
+    // ADR-022 trailing-edge boundary: spike at oldest position still inside window (w_start).
+    // 7 positive deltas: d0-d2 small, d3=spike, d4-d6 small.
+    // n=7, W=4, w_start=3 → last W=[d3,d4,d5,d6] → spike still captured → velocity=spike.
+    // One more positive delta would push w_start to 4, aging the spike out.
+    #[test]
+    fn test_spike_at_window_boundary_still_warns() {
+        let base = 10_000u64;
+        let spike = 79_400u64;
+        let points = vec![
+            pt(0, base),
+            pt(1, base + 100),
+            pt(2, base + 200),
+            pt(3, base + 300),
+            pt(4, base + 300 + spike), // d3 = spike; w_start=3 when 7 deltas exist
+            pt(5, base + 300 + spike + 100),
+            pt(6, base + 300 + spike + 200),
+            pt(7, base + 300 + spike + 300),
+        ];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(trend.velocity_tokens_per_turn, Some(spike));
     }
 
     // velocity picks single delta when only one positive delta.
@@ -309,11 +371,11 @@ mod tests {
         assert_eq!(trend.velocity_tokens_per_turn, Some(40_000));
     }
 
-    // velocity picks larger delta when two positive deltas.
+    // velocity picks larger delta when two positive deltas (both in window).
     #[test]
     fn test_velocity_picks_max_of_two_deltas() {
         let points = vec![pt(0, 10_000), pt(1, 11_000), pt(2, 21_000)];
-        // deltas: [1k, 10k] → max = 10k
+        // deltas: [1k, 10k] → both in last W=4 → max = 10k
         let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(trend.velocity_tokens_per_turn, Some(10_000));
     }
