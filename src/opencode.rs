@@ -15,7 +15,6 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::home_dir,
     provider::Provider,
-    verdict::ABSOLUTE_RECYCLE_BACKSTOP,
     window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use anyhow::Result;
@@ -57,12 +56,12 @@ impl OpencodeProvider {
         Ok(conn)
     }
 
-    fn load_sessions_inner(&self) -> Vec<SessionNode> {
+    fn load_sessions_inner(&self, backstop: u64) -> Vec<SessionNode> {
         let conn = match self.open() {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        discover_sessions(&conn)
+        discover_sessions(&conn, backstop)
     }
 }
 
@@ -71,8 +70,8 @@ impl Provider for OpencodeProvider {
         self.db_path().exists()
     }
 
-    fn load_sessions(&self) -> Vec<SessionNode> {
-        self.load_sessions_inner()
+    fn load_sessions(&self, backstop: u64) -> Vec<SessionNode> {
+        self.load_sessions_inner(backstop)
     }
 }
 
@@ -141,7 +140,7 @@ fn project_key(conn: &Connection, project_id: Option<&str>, directory: Option<&s
 /// 1. Query last TREND_TAIL_K step-finish parts (point-in-time oracle, ADR-005/ADR-006).
 /// 2. If found, build WindowInfo + WindowTrend from their `data.tokens` (LastTurn).
 /// 3. Else fall back to `session` aggregate columns (Aggregate), trend = None.
-pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
+pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
     let mut stmt = match conn.prepare(
         "SELECT id, parent_id, agent, model, directory, project_id,
                 tokens_input, tokens_cache_read, tokens_cache_write, tokens_output, time_updated
@@ -189,7 +188,7 @@ pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
     for row in raw {
         let model = parse_model_id(row.model_json.as_deref());
         let pkey = project_key(conn, row.project_id.as_deref(), row.directory.as_deref());
-        let (window, last_turn_at, trend) = step_finish_oracle(conn, &row.id, &model)
+        let (window, last_turn_at, trend) = step_finish_oracle(conn, &row.id, &model, backstop)
             .unwrap_or_else(|| {
                 (
                     aggregate_window(&row, &model),
@@ -260,7 +259,12 @@ pub fn discover_sessions(conn: &Connection) -> Vec<SessionNode> {
 ///
 /// Occupancy: prefer `tokens.total` when present; else sum
 /// `input + output + cache.read + cache.write`.
-fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepFinishResult {
+fn step_finish_oracle(
+    conn: &Connection,
+    session_id: &str,
+    model: &str,
+    backstop: u64,
+) -> StepFinishResult {
     let mut stmt = conn
         .prepare(
             "SELECT data, time_created FROM part
@@ -363,7 +367,7 @@ fn step_finish_oracle(conn: &Connection, session_id: &str, model: &str) -> StepF
     }
 
     let trend = if !timeline_points.is_empty() {
-        Some(compute_trend(timeline_points, ABSOLUTE_RECYCLE_BACKSTOP))
+        Some(compute_trend(timeline_points, backstop))
     } else {
         None
     };
@@ -412,6 +416,7 @@ fn ts_from_ms(ms: i64) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verdict::ABSOLUTE_RECYCLE_BACKSTOP;
     use rusqlite::Connection;
 
     /// Open an in-memory sqlite db with the opencode schema seed the tests need.
@@ -488,7 +493,7 @@ mod tests {
         )
         .unwrap();
 
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(nodes.len(), 1);
         let w = nodes[0].window.as_ref().expect("window present");
         assert_eq!(w.window_tokens, 46_826);
@@ -520,7 +525,7 @@ mod tests {
         )
         .unwrap();
 
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(nodes.len(), 1);
         let w = nodes[0].window.as_ref().expect("window");
         // 5000 + 30000 + 0 (cache_write) + 2000 (output) = 37000
@@ -546,7 +551,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(nodes.len(), 1);
         let w = nodes[0].window.as_ref().expect("window");
         // input=1000 + output=500 = 1500
@@ -571,7 +576,7 @@ mod tests {
         )
         .unwrap();
 
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(
             nodes.len(),
             1,
@@ -603,7 +608,7 @@ mod tests {
             params![model_json("z-ai/glm-5.2")],
         )
         .unwrap();
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(nodes[0].project_key, "brim");
 
         // Now a session with no project row — must fall back to directory basename.
@@ -613,7 +618,7 @@ mod tests {
             params![model_json("z-ai/glm-5.2")],
         )
         .unwrap();
-        let nodes2 = discover_sessions(&conn);
+        let nodes2 = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         let delta = nodes2
             .iter()
             .find(|n| n.session_uuid == "ses_delta")
@@ -645,7 +650,7 @@ mod tests {
             params![part_data],
         )
         .unwrap();
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         let w = nodes[0].window.as_ref().unwrap();
         assert_eq!(
             w.window_tokens, 46_826,
@@ -661,7 +666,7 @@ mod tests {
         };
         assert!(!p.is_available());
         // load_sessions must not panic when the db is missing.
-        assert!(p.load_sessions().is_empty());
+        assert!(p.load_sessions(ABSOLUTE_RECYCLE_BACKSTOP).is_empty());
     }
 
     #[test]
@@ -673,7 +678,7 @@ mod tests {
             params![model_json("z-ai/glm-5.2")],
         )
         .unwrap();
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].window.is_none());
     }
@@ -716,7 +721,7 @@ mod tests {
         )
         .unwrap();
 
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(nodes.len(), 1);
         let trend = nodes[0].trend.as_ref().expect("trend present");
         assert_eq!(trend.points.len(), 2);
@@ -752,7 +757,7 @@ mod tests {
             params![part_data],
         )
         .unwrap();
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         let w = nodes[0].window.as_ref().unwrap();
         assert_eq!(w.window_tokens, 46_826);
     }
@@ -783,7 +788,7 @@ mod tests {
             params![part_data],
         )
         .unwrap();
-        let nodes = discover_sessions(&conn);
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         let w = nodes[0].window.as_ref().unwrap();
         assert_eq!(w.window_tokens, 150);
     }

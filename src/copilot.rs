@@ -12,7 +12,6 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
-    verdict::ABSOLUTE_RECYCLE_BACKSTOP,
     window::{TREND_TAIL_K, compute_trend},
 };
 use chrono::{DateTime, Utc};
@@ -45,7 +44,7 @@ impl Provider for CopilotProvider {
         self.state_root().exists() || self.log_root().exists()
     }
 
-    fn load_sessions(&self) -> Vec<SessionNode> {
+    fn load_sessions(&self, backstop: u64) -> Vec<SessionNode> {
         if !self.is_available() {
             return Vec::new();
         }
@@ -53,12 +52,12 @@ impl Provider for CopilotProvider {
         if !state_root.exists() {
             return Vec::new();
         }
-        collect_sessions(&state_root, &self.log_root())
+        collect_sessions(&state_root, &self.log_root(), backstop)
     }
 }
 
 /// Walk `session-state/<uuid>/` (one level, flat), capped at MAX_SESSIONS.
-fn collect_sessions(state_root: &Path, log_root: &Path) -> Vec<SessionNode> {
+fn collect_sessions(state_root: &Path, log_root: &Path, backstop: u64) -> Vec<SessionNode> {
     let Ok(entries) = std::fs::read_dir(state_root) else {
         return Vec::new();
     };
@@ -67,7 +66,7 @@ fn collect_sessions(state_root: &Path, log_root: &Path) -> Vec<SessionNode> {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if let Some(node) = parse_session_dir(&entry.path(), log_root) {
+        if let Some(node) = parse_session_dir(&entry.path(), log_root, backstop) {
             sessions.push(node);
         }
         if sessions.len() >= MAX_SESSIONS {
@@ -77,7 +76,7 @@ fn collect_sessions(state_root: &Path, log_root: &Path) -> Vec<SessionNode> {
     sessions
 }
 
-fn parse_session_dir(dir: &Path, log_root: &Path) -> Option<SessionNode> {
+fn parse_session_dir(dir: &Path, log_root: &Path, backstop: u64) -> Option<SessionNode> {
     let workspace_path = dir.join("workspace.yaml");
     let workspace = read_tail(&workspace_path).unwrap_or_default();
 
@@ -101,7 +100,7 @@ fn parse_session_dir(dir: &Path, log_root: &Path) -> Option<SessionNode> {
     };
 
     // Point-in-time occupancy from process log (REQ-009).
-    let (window, trend) = process_log_occupancy(dir, log_root)
+    let (window, trend) = process_log_occupancy(dir, log_root, backstop)
         .map(|(w, t)| (Some(w), Some(t)))
         .unwrap_or((None, None));
 
@@ -119,7 +118,11 @@ fn parse_session_dir(dir: &Path, log_root: &Path) -> Option<SessionNode> {
 }
 
 /// Returns window + trend from the process log; None when lock or log is missing/malformed.
-fn process_log_occupancy(session_dir: &Path, log_root: &Path) -> Option<(WindowInfo, WindowTrend)> {
+fn process_log_occupancy(
+    session_dir: &Path,
+    log_root: &Path,
+    backstop: u64,
+) -> Option<(WindowInfo, WindowTrend)> {
     let pid = find_pid_from_lock(session_dir)?;
     let log_path = find_process_log(log_root, pid)?;
     let tail = read_tail(&log_path).ok()?;
@@ -131,7 +134,7 @@ fn process_log_occupancy(session_dir: &Path, log_root: &Path) -> Option<(WindowI
         points.drain(0..points.len() - TREND_TAIL_K);
     }
     let latest = points.last()?.window_tokens;
-    let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+    let trend = compute_trend(points, backstop);
     let window = WindowInfo {
         window_tokens: latest,
         model: "copilot".to_string(),
@@ -383,7 +386,7 @@ mod tests {
         let log_root = tmp.join("logs");
         std::fs::create_dir_all(&log_root).unwrap();
 
-        assert!(process_log_occupancy(&tmp, &log_root).is_none());
+        assert!(process_log_occupancy(&tmp, &log_root, ABSOLUTE_RECYCLE_BACKSTOP).is_none());
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -397,7 +400,9 @@ mod tests {
 
         std::fs::write(session_dir.join("inuse.9999.lock"), "").unwrap();
         // No matching process-*.log in log_root.
-        assert!(process_log_occupancy(&session_dir, &log_root).is_none());
+        assert!(
+            process_log_occupancy(&session_dir, &log_root, ABSOLUTE_RECYCLE_BACKSTOP).is_none()
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -454,7 +459,7 @@ mod tests {
             home: PathBuf::from("/nonexistent/zzz_brim_copilot_test"),
         };
         assert!(!p.is_available());
-        assert!(p.load_sessions().is_empty());
+        assert!(p.load_sessions(ABSOLUTE_RECYCLE_BACKSTOP).is_empty());
     }
 
     #[test]
@@ -476,7 +481,7 @@ mod tests {
         .unwrap();
 
         // No inuse.*.lock → window=None from process log path.
-        let node = parse_session_dir(&tmp, &log_root).expect("node");
+        let node = parse_session_dir(&tmp, &log_root, ABSOLUTE_RECYCLE_BACKSTOP).expect("node");
         assert_eq!(node.session_uuid, "copilot-session-abc");
         assert_eq!(node.project_key, "myproject");
         assert!(node.agent_id.is_none());
@@ -508,7 +513,7 @@ mod tests {
 
         let provider = CopilotProvider { home: tmp.clone() };
         assert!(provider.is_available());
-        let sessions = provider.load_sessions();
+        let sessions = provider.load_sessions(ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1, "exactly one session discovered");
         assert_eq!(sessions[0].session_uuid, "walk-session-1");
         assert!(sessions[0].agent_id.is_none());
@@ -544,7 +549,8 @@ mod tests {
         )
         .unwrap();
 
-        let node = parse_session_dir(&session_dir, &log_root).expect("node");
+        let node =
+            parse_session_dir(&session_dir, &log_root, ABSOLUTE_RECYCLE_BACKSTOP).expect("node");
         assert_eq!(node.session_uuid, "e2e-session");
         assert_eq!(node.project_key, "project");
 

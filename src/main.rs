@@ -334,7 +334,7 @@ fn main() -> Result<()> {
 
     let mut sessions: Vec<SessionNode> = Vec::new();
     for p in providers.iter().filter(|p| p.is_available()) {
-        sessions.extend(p.load_sessions());
+        sessions.extend(p.load_sessions(thresholds.recycle_backstop));
     }
     // De-dup not performed: providers may legitimately share a project key; the
     // project_key field carries the source-provider prefix only when needed for

@@ -2,7 +2,6 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
-    verdict::ABSOLUTE_RECYCLE_BACKSTOP,
     window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use chrono::{DateTime, Utc};
@@ -39,8 +38,8 @@ impl Provider for ClaudeProvider {
         self.projects_dir().exists()
     }
 
-    fn load_sessions(&self) -> Vec<SessionNode> {
-        discover_sessions(&self.projects_dir())
+    fn load_sessions(&self, backstop: u64) -> Vec<SessionNode> {
+        discover_sessions(&self.projects_dir(), backstop)
     }
 }
 
@@ -56,6 +55,7 @@ struct TurnData {
 /// and return the last-turn WindowInfo, its timestamp, and the velocity trend.
 fn parse_transcript(
     path: &Path,
+    backstop: u64,
 ) -> (
     Option<WindowInfo>,
     Option<DateTime<Utc>>,
@@ -167,7 +167,7 @@ fn parse_transcript(
         .collect();
 
     let trend = if !timeline_points.is_empty() {
-        Some(compute_trend(timeline_points, ABSOLUTE_RECYCLE_BACKSTOP))
+        Some(compute_trend(timeline_points, backstop))
     } else {
         None
     };
@@ -180,7 +180,7 @@ fn agent_id_from_stem(stem: &str) -> Option<String> {
 }
 
 /// Discover parent sessions and sub-agents in a single encoded-cwd project directory.
-pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
+pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
     let project_key = project_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -217,7 +217,7 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
 
     for (_, name, path) in jsonl_files {
         let uuid = name.trim_end_matches(".jsonl").to_string();
-        let (window, last_turn_at, trend) = parse_transcript(&path);
+        let (window, last_turn_at, trend) = parse_transcript(&path, backstop);
         parents.push(SessionNode {
             session_uuid: uuid,
             agent_id: None,
@@ -262,7 +262,7 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
                     continue;
                 }
                 let agent_id = agent_id_from_stem(sub_stem);
-                let (window, last_turn_at, trend) = parse_transcript(&sub_path);
+                let (window, last_turn_at, trend) = parse_transcript(&sub_path, backstop);
                 children.push(SessionNode {
                     session_uuid: parent_uuid.clone(),
                     agent_id,
@@ -286,7 +286,7 @@ pub fn discover_project(project_dir: &Path) -> Vec<SessionNode> {
     parents
 }
 
-pub(crate) fn discover_sessions(projects_dir: &Path) -> Vec<SessionNode> {
+pub(crate) fn discover_sessions(projects_dir: &Path, backstop: u64) -> Vec<SessionNode> {
     let Ok(entries) = fs::read_dir(projects_dir) else {
         return Vec::new();
     };
@@ -297,7 +297,7 @@ pub(crate) fn discover_sessions(projects_dir: &Path) -> Vec<SessionNode> {
         }
         let path = entry.path();
         if path.is_dir() {
-            let project_sessions = discover_project(&path);
+            let project_sessions = discover_project(&path, backstop);
             let remaining = MAX_PARENT_SESSIONS - sessions.len();
             sessions.extend(project_sessions.into_iter().take(remaining));
         }
@@ -308,6 +308,7 @@ pub(crate) fn discover_sessions(projects_dir: &Path) -> Vec<SessionNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verdict::ABSOLUTE_RECYCLE_BACKSTOP;
     use std::fs;
 
     // B1: saturating_add prevents overflow on adversarial huge u64 token values.
@@ -356,7 +357,7 @@ mod tests {
             "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7000,\"cache_read_input_tokens\":130000,\"cache_creation_input_tokens\":5000,\"output_tokens\":200}}}\n",
         );
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         let w = sessions[0].window.as_ref().unwrap();
         assert_eq!(w.window_tokens, 142_000);
@@ -393,7 +394,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1, "one parent session expected");
         let parent = &sessions[0];
         assert_eq!(parent.session_uuid, parent_uuid);
@@ -427,7 +428,7 @@ mod tests {
         let jsonl = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":10}}}\n";
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].children.len(), 0);
 
@@ -451,7 +452,7 @@ mod tests {
         fs::create_dir_all(&project_b).unwrap();
         fs::write(project_b.join(format!("{uuid}.jsonl")), jsonl).unwrap();
 
-        let sessions = discover_sessions(&tmp);
+        let sessions = discover_sessions(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 2, "both sessions must appear (no dedup)");
 
         let keys: std::collections::HashSet<&str> =
@@ -486,7 +487,7 @@ mod tests {
         );
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].window.is_some());
         assert_eq!(sessions[0].window.as_ref().unwrap().window_tokens, 40_000);
@@ -504,7 +505,7 @@ mod tests {
         let jsonl = "{\"type\":\"assistant\",\"timestamp\":\"2026-06-23T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n";
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].last_turn_at.is_some());
 
@@ -521,7 +522,7 @@ mod tests {
         let jsonl = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":50}}}\n";
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].last_turn_at.is_none());
 
@@ -541,7 +542,7 @@ mod tests {
             "{\"type\":\"assistant\",\"timestamp\":\"2026-06-23T11:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n",
         );
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         // Must be 10:00 (the window turn), not 11:00 (zero-usage turn)
         let ts = sessions[0].last_turn_at.unwrap();
@@ -562,12 +563,51 @@ mod tests {
             "{\"type\":\"assistant\",\"timestamp\":\"2026-06-23T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":70000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
         );
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         let trend = sessions[0].trend.as_ref().expect("trend present");
         assert_eq!(trend.points.len(), 2);
         assert_eq!(trend.velocity_tokens_per_turn, Some(20_000));
         assert_eq!(trend.projected_turns_to_recycle, Some(2));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // REQ-004: projection must use the configured backstop, not the hardcoded default.
+    // Same trace as test_trend_built_from_multiple_turns (50k→70k, velocity=20k).
+    // default backstop=128k → projection=(128k-70k)/20k=2
+    // custom backstop=100k  → projection=(100k-70k)/20k=1
+    #[test]
+    fn test_projection_uses_configured_backstop() {
+        let tmp = std::env::temp_dir().join("brim_test_proj_backstop");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let uuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-23T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-23T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":70000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+
+        let sessions_default = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        let proj_default = sessions_default[0]
+            .trend
+            .as_ref()
+            .expect("trend")
+            .projected_turns_to_recycle;
+        assert_eq!(proj_default, Some(2));
+
+        let sessions_custom = discover_project(&tmp, 100_000);
+        let proj_custom = sessions_custom[0]
+            .trend
+            .as_ref()
+            .expect("trend")
+            .projected_turns_to_recycle;
+        assert_eq!(proj_custom, Some(1));
+
+        assert_ne!(
+            proj_default, proj_custom,
+            "projection must differ when backstop differs"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -584,7 +624,7 @@ mod tests {
             "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":70000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
         );
         fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1);
         // Window is still computed (last valid turn)
         assert!(sessions[0].window.is_some());
@@ -616,7 +656,7 @@ mod tests {
             f.set_times(FileTimes::new().set_modified(mtime)).unwrap();
         }
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), MAX_FILES_PER_PROJECT, "cap not applied");
 
         // The 5 oldest files (indices 0..5) must be dropped; all newer ones retained.
@@ -664,7 +704,7 @@ mod tests {
                 .unwrap();
         }
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), MAX_FILES_PER_PROJECT, "cap not applied");
 
         // Tiebreak is ascending filename: 00000..00063 retained, 00064..00068 dropped.
@@ -686,7 +726,7 @@ mod tests {
         }
 
         // Stability: repeated call must return the same retained set.
-        let sessions2 = discover_project(&tmp);
+        let sessions2 = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         let uuids2: std::collections::HashSet<_> =
             sessions2.iter().map(|s| s.session_uuid.as_str()).collect();
         assert_eq!(
@@ -732,7 +772,7 @@ mod tests {
         f.set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
             .unwrap();
 
-        let sessions = discover_project(&tmp);
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), MAX_FILES_PER_PROJECT, "cap not applied");
 
         let uuids: std::collections::HashSet<_> =

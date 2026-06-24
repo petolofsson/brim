@@ -17,7 +17,6 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
-    verdict::ABSOLUTE_RECYCLE_BACKSTOP,
     window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use chrono::{DateTime, Utc};
@@ -46,16 +45,16 @@ impl Provider for CodexProvider {
         self.sessions_dir().exists()
     }
 
-    fn load_sessions(&self) -> Vec<SessionNode> {
+    fn load_sessions(&self, backstop: u64) -> Vec<SessionNode> {
         if !self.is_available() {
             return Vec::new();
         }
-        collect_sessions(&self.sessions_dir())
+        collect_sessions(&self.sessions_dir(), backstop)
     }
 }
 
 /// Walk `sessions_dir/YYYY/MM/DD/*.jsonl` (depth 3, capped at MAX_SESSIONS).
-fn collect_sessions(sessions_dir: &Path) -> Vec<SessionNode> {
+fn collect_sessions(sessions_dir: &Path, backstop: u64) -> Vec<SessionNode> {
     let mut files: Vec<PathBuf> = Vec::new();
     let Ok(years) = std::fs::read_dir(sessions_dir) else {
         return Vec::new();
@@ -84,17 +83,20 @@ fn collect_sessions(sessions_dir: &Path) -> Vec<SessionNode> {
             }
         }
     }
-    files.iter().filter_map(|f| parse_session_file(f)).collect()
+    files
+        .iter()
+        .filter_map(|f| parse_session_file(f, backstop))
+        .collect()
 }
 
-fn parse_session_file(path: &Path) -> Option<SessionNode> {
+fn parse_session_file(path: &Path, backstop: u64) -> Option<SessionNode> {
     // Known limitations for >256KB sessions: the final turn-span may be
     // truncated; cwd and the full-span token header live before the tail window.
     let tail = read_tail(path).ok()?;
     let session_id = extract_session_id(path, &tail);
     let model = extract_model(&tail);
     let project_key = extract_project_key(&tail);
-    let (window, last_turn_at, trend) = extract_window(&tail, &model);
+    let (window, last_turn_at, trend) = extract_window(&tail, &model, backstop);
     Some(SessionNode {
         session_uuid: session_id,
         agent_id: None,
@@ -231,6 +233,7 @@ fn parse_token_counts(v: &Value) -> TokenCounts {
 fn extract_window(
     tail: &str,
     model: &str,
+    backstop: u64,
 ) -> (
     Option<WindowInfo>,
     Option<DateTime<Utc>>,
@@ -335,7 +338,7 @@ fn extract_window(
                 });
             }
             if points.len() >= 2 {
-                Some(compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP))
+                Some(compute_trend(points, backstop))
             } else {
                 None
             }
@@ -367,6 +370,7 @@ fn parse_timestamp(v: &Value) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::model::WindowSource;
+    use crate::verdict::ABSOLUTE_RECYCLE_BACKSTOP;
     use std::io::Write;
 
     fn make_token_count_line(input: u64, cached: u64, ts: &str) -> String {
@@ -397,7 +401,7 @@ mod tests {
         let line2 = make_token_count_line(120_000, 80_000, "2024-06-01T10:01:00Z");
         let tail = format!("{line1}\n{line2}\n");
 
-        let (window, ts, _trend) = extract_window(&tail, "codex");
+        let (window, ts, _trend) = extract_window(&tail, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 20_000);
         assert_eq!(w.window_source, WindowSource::LastTurn);
@@ -410,7 +414,7 @@ mod tests {
     #[test]
     fn test_codex_single_event_aggregate() {
         let line = make_token_count_line(50_000, 30_000, "2024-06-01T10:00:00Z");
-        let (window, _, _trend) = extract_window(&line, "codex");
+        let (window, _, _trend) = extract_window(&line, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 50_000);
         assert_eq!(w.window_source, WindowSource::Aggregate);
@@ -421,7 +425,7 @@ mod tests {
     fn test_codex_malformed_line_skipped() {
         let good = make_token_count_line(40_000, 0, "2024-06-01T10:00:00Z");
         let tail = format!("{{not valid json\n{good}\n");
-        let (window, _, _trend) = extract_window(&tail, "codex");
+        let (window, _, _trend) = extract_window(&tail, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         // malformed line silently skipped; good line parsed → Aggregate (1 event)
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 40_000);
@@ -435,7 +439,7 @@ mod tests {
             home: PathBuf::from("/nonexistent/zzz_brim_codex_test"),
         };
         assert!(!p.is_available());
-        assert!(p.load_sessions().is_empty());
+        assert!(p.load_sessions(ABSOLUTE_RECYCLE_BACKSTOP).is_empty());
     }
 
     // Round-trip: write a synthetic JSONL to a temp path and parse it end-to-end.
@@ -467,7 +471,7 @@ mod tests {
         .unwrap();
         drop(f);
 
-        let node = parse_session_file(&file_path).expect("node");
+        let node = parse_session_file(&file_path, ABSOLUTE_RECYCLE_BACKSTOP).expect("node");
         assert_eq!(node.session_uuid, "abc-session-1");
         assert_eq!(node.project_key, "myproject");
         assert!(node.agent_id.is_none());
@@ -504,7 +508,7 @@ mod tests {
 
         let provider = CodexProvider { home: tmp.clone() };
         assert!(provider.is_available());
-        let sessions = provider.load_sessions();
+        let sessions = provider.load_sessions(ABSOLUTE_RECYCLE_BACKSTOP);
         assert_eq!(sessions.len(), 1, "exactly one session discovered");
         assert_eq!(sessions[0].session_uuid, "walk-session-1");
         assert!(sessions[0].agent_id.is_none());
@@ -521,7 +525,7 @@ mod tests {
         let line3 = make_token_count_line(6_000, 0, "2024-06-01T10:02:00Z");
         let tail = format!("{line1}\n{line2}\n{line3}\n");
 
-        let (window, _, _trend) = extract_window(&tail, "codex");
+        let (window, _, _trend) = extract_window(&tail, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 1_000);
         assert_eq!(w.window_source, WindowSource::LastTurn);
@@ -539,7 +543,7 @@ mod tests {
         let line4 = make_token_count_line(55_000, 0, "2024-06-01T10:03:00Z");
         let tail = format!("{line1}\n{line2}\n{line3}\n{line4}\n");
 
-        let (_, _, trend) = extract_window(&tail, "codex");
+        let (_, _, trend) = extract_window(&tail, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         let t = trend.expect("trend must be present");
         assert!(
             t.velocity_tokens_per_turn.is_some(),
@@ -560,7 +564,7 @@ mod tests {
         let line5 = make_token_count_line(60_000, 0, "2024-06-01T10:04:00Z");
         let tail = format!("{line1}\n{line2}\n{line3}\n{line4}\n{line5}\n");
 
-        let (_, _, trend) = extract_window(&tail, "codex");
+        let (_, _, trend) = extract_window(&tail, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         let t = trend.expect("trend present");
         assert!(
             t.velocity_tokens_per_turn.is_some(),
@@ -579,7 +583,7 @@ mod tests {
         let line5 = make_token_count_line(35_000, 0, "2024-06-01T10:02:00Z");
         let tail = format!("{line1}\n{line2}\n{line3}\n{line4}\n{line5}\n");
 
-        let (_, _, trend) = extract_window(&tail, "codex");
+        let (_, _, trend) = extract_window(&tail, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         let t = trend.expect("trend present");
         for pt in &t.points {
             assert!(
@@ -598,7 +602,7 @@ mod tests {
         let line3 = make_token_count_line(20_000, 0, "2024-06-01T10:01:30Z"); // trailing dup
         let tail = format!("{line1}\n{line2}\n{line3}\n");
 
-        let (window, _, _) = extract_window(&tail, "codex");
+        let (window, _, _) = extract_window(&tail, "codex", ABSOLUTE_RECYCLE_BACKSTOP);
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 10_000, "trailing dup must not zero window");
         assert_eq!(w.window_source, WindowSource::LastTurn);
