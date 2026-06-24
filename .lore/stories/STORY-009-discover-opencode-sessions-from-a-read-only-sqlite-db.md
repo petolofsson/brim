@@ -17,7 +17,7 @@ related_tests: [TEST-004]
 As a brim-driven orchestrator,
 I want brim to discover opencode sessions from its SQLite DB (strictly
 read-only) and report each session's point-in-time window with provenance,
-So that I can self-diagnagnose opencode sub-agent contexts without brim
+So that I can self-diagnose opencode sub-agent contexts without brim
 mutating the database.
 
 Shipped behavior (satisfies REQ-008): `src/opencode.rs::OpencodeProvider`

@@ -21,7 +21,7 @@ So that I can decide whether to recycle *before* the window overbounds.
 
 Shipped behavior (satisfies REQ-007): `src/window.rs::compute_trend` +
 `TREND_TAIL_K = 8` (`src/window.rs:5`) read only the last K assistant turns;
-`src/claude.rs::parse_transcript` (`src/claude.rs:55-175`) builds the `points`,
+`src/claude.rs::parse_transcript` (`src/claude.rs:57-175`) builds the `points`,
 labels `window_source = LastTurn`, and returns a `WindowTrend`
 (velocity = median positive post-reset delta; projection vs the absolute
 recycle backstop); `--json` serializes `trend.velocity` + `trend.proj_turns`

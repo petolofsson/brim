@@ -1,7 +1,7 @@
 ---
 id: STORY-003
 title: Verify provider data semantics against official docs and real sessions
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-002
 related_adrs:
