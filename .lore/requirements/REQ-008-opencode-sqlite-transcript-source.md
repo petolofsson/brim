@@ -1,14 +1,14 @@
 ---
 id: REQ-008
 title: opencode SQLite transcript source
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-002
   - REQ-005
 related_adrs:
   - ADR-002
   - ADR-005
-related_stories: []
+related_stories: [STORY-009]
 related_tests:
   - TEST-004
 ---

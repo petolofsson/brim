@@ -7,8 +7,8 @@ related_requirements:
   - REQ-005
   - REQ-007
 related_adrs: []
-related_stories: []
-related_tests: []
+related_stories: [STORY-008]
+related_tests: [TEST-007]
 ---
 
 # ADR-004 - Snapshot persistence belongs to the consumer, not brim

@@ -9,7 +9,8 @@ related_adrs:
   - ADR-004
 related_stories:
   - STORY-001
-related_tests: []
+  - STORY-008
+related_tests: [TEST-007]
 ---
 
 # ADR-006 - Velocity and overbound projection from a bounded last-K tail read

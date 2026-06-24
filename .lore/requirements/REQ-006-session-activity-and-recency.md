@@ -4,9 +4,9 @@ title: Session activity and recency
 status: Accepted
 related_requirements:
   - FEATURE-001
-related_adrs: []
-related_stories: []
-related_tests: []
+related_adrs: [ADR-016]
+related_stories: [STORY-007]
+related_tests: [TEST-006]
 ---
 
 # REQ-006 - Session activity and recency

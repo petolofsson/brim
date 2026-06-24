@@ -1,14 +1,14 @@
 ---
 id: TEST-004
 title: opencode last-turn from step-finish
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-002
   - REQ-008
 related_adrs:
   - ADR-005
   - ADR-012
-related_stories: []
+related_stories: [STORY-009]
 related_tests: []
 ---
 

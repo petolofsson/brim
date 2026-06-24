@@ -1,7 +1,7 @@
 ---
 id: FEATURE-002
 title: opencode provider
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-002
   - REQ-008

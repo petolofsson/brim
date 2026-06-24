@@ -4,8 +4,8 @@ title: Copilot per-turn window from process logs
 status: Accepted
 related_requirements: [REQ-002]
 related_adrs: [ADR-002]
-related_stories: []
-related_tests: []
+related_stories: [STORY-010]
+related_tests: [TEST-008]
 ---
 
 # REQ-009 - Copilot per-turn window from process logs

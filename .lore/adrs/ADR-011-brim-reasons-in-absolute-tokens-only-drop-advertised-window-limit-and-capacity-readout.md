@@ -7,8 +7,8 @@ related_requirements:
   - REQ-004
   - REQ-007
 related_adrs: []
-related_stories: []
-related_tests: []
+related_stories: [STORY-010]
+related_tests: [TEST-008]
 ---
 
 # ADR-011 - brim reasons in absolute tokens only; drop advertised-window limit and capacity readout

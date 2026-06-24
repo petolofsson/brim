@@ -7,7 +7,7 @@ related_requirements:
 related_adrs:
   - ADR-002
   - ADR-015
-related_stories: []
+related_stories: [STORY-009]
 related_tests:
   - TEST-004
 ---

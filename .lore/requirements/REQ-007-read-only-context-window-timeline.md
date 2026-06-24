@@ -1,12 +1,12 @@
 ---
 id: REQ-007
 title: Read-only context-window timeline
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
-related_adrs: [ADR-004, ADR-002]
-related_stories: []
-related_tests: []
+related_adrs: [ADR-004, ADR-002, ADR-006]
+related_stories: [STORY-008]
+related_tests: [TEST-007]
 ---
 
 # REQ-007 - Read-only context-window timeline
