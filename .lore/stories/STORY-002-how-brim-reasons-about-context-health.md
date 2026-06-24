@@ -1,7 +1,7 @@
 ---
 id: STORY-002
 title: How brim reasons about context health
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-007
@@ -11,6 +11,7 @@ related_adrs:
   - ADR-008
   - ADR-009
   - ADR-010
+  - ADR-011
 related_stories: []
 related_tests: []
 ---
@@ -35,6 +36,8 @@ root constraint behind everything below — brim observes, it never intercepts, 
 it never mutates a session.
 
 ## Two denominators, two different questions
+
+> Note (post-ADR-011): the advertised-window % denominator and capacity-runway readout described below were REMOVED by ADR-011. brim now reasons in absolute tokens only; see ADR-011.
 
 A token count is meaningless without a denominator. brim deliberately keeps
 **two**, because they answer two unrelated questions (ADR-010):
@@ -136,3 +139,7 @@ follows directly from the read-only, stateless vantage point above.
   discrete quality drop caused by harness auto-compaction/summarization. The
   qualitative case for deliberate early recycling (don't let the harness make the
   lossy discard for you) stands, but the size of the loss is unmeasured.
+
+## Acceptance Criteria
+
+- [x] The narrative accurately describes brim's reasoning model (point-in-time window, absolute effective budget, four-gate OR recycle, self-vs-subtree, advisory-only) as implemented and accepted in ADR-002/004/006/007/008/009/010/011.

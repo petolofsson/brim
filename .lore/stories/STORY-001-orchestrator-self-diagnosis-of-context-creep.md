@@ -1,7 +1,7 @@
 ---
 id: STORY-001
 title: Orchestrator self-diagnosis of context creep
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-001
@@ -19,3 +19,9 @@ related_tests:
 # STORY-001 - Orchestrator self-diagnosis of context creep
 
 As an orchestrator running multiple sub-agents, I want to see the context-window fill of myself and each sub-agent at a glance, so that I can recommend recycling a session into a fresh one before its context overbounds and quality degrades.
+
+## Acceptance Criteria
+
+- [x] `brim --tree` renders the orchestrator's own session and each sub-agent with window occupancy + verdict.
+- [x] A recycle is recommended (deepest unhealthy node + blast radius) when any subtree crosses the verdict threshold (ADR-009 / ADR-010).
+- [x] Default output is active-only; `--all` exposes historical sessions (REQ-006).
