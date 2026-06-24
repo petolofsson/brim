@@ -24,8 +24,8 @@ Shipped behavior (satisfies REQ-006): `src/main.rs:160-165` `is_active` (active
 iff `last_turn_at` within `--active-mins`, default 30, at `src/main.rs:62-64`);
 `src/main.rs:167-169` `any_active` keeps a stale parent that has an active
 child; `src/main.rs:355-357` retains active-only unless `--all` or `--session`;
-`src/main.rs:171-192` `age_str` renders recency for the text view;
-`src/main.rs:288` serializes `last_turn_at` + `active` in `--json`. ADR-016
+`src/output.rs:208` `age_str` renders recency for the text view;
+`src/output.rs:185-186` serializes `last_turn_at` + `active` in `--json`. ADR-016
 records the absent-timestamp → inactive default.
 
 ## Acceptance Criteria

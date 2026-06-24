@@ -30,7 +30,7 @@ low-tokens goal and undermines brim's core purpose.
 
 ## Scope / candidate levers
 
-In the `src/main.rs` JSON path (`JsonNode`, `JsonSubtreeInfo`, `JsonRecycleRecommendation`):
+In the `src/output.rs` JSON path (`JsonNode`, `JsonSubtreeInfo`, `JsonRecycleRecommendation`):
 
 - The per-turn `trend.points` array is the largest contributor — cap/drop it or make the
   timeline opt-in via a flag (e.g. `--json-timeline`).
