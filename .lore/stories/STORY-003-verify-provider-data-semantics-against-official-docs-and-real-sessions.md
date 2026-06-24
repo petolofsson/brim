@@ -8,6 +8,7 @@ related_adrs:
   - ADR-002
   - ADR-005
   - ADR-006
+  - ADR-015
 related_stories: []
 related_tests: []
 ---

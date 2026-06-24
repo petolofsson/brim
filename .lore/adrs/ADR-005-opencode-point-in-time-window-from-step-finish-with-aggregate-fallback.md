@@ -1,17 +1,20 @@
 ---
 id: ADR-005
 title: opencode point-in-time window from step-finish with aggregate fallback
-status: Draft
+status: Superseded
 related_requirements:
   - REQ-008
 related_adrs:
   - ADR-002
+  - ADR-015
 related_stories: []
 related_tests:
   - TEST-004
 ---
 
 # ADR-005 - opencode point-in-time window from step-finish with aggregate fallback
+
+> **Superseded by ADR-015** — the 200k limit assumption is corrected to 1,000,000 for `z-ai/glm-5.2`. The step-finish oracle, `parent_id` join, and aggregate-fallback design below remain in force.
 
 ## Context
 
