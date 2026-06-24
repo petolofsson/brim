@@ -6,11 +6,11 @@
 # REQ-015: always exits 0 and degrades to a neutral value on any failure.
 # REQ-010: always renders ambient occupancy/verdict (the only surface on 'ok').
 
-# ANSI colour codes
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-RESET='\033[0m'
+# ANSI colour codes — use printf to get real ESC byte (0x1b), not literal backslash
+GREEN=$(printf '\033[0;32m')
+YELLOW=$(printf '\033[1;33m')
+RED=$(printf '\033[0;31m')
+RESET=$(printf '\033[0m')
 
 # --- read session_id from stdin JSON ---
 stdin_json=$(cat)
