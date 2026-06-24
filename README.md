@@ -5,8 +5,10 @@ and its sub-agents — so you can recycle a session before it overbounds.
 
 ## Run
 
-```sh
-cargo run -- --tree
+```
+brim [--tree] [--session <id>] [--json] [--all] [--active-mins <N>]
+     [--watch-tokens <N>] [--recycle-backstop <N>] [--once]
+# default: active-only flat list
 ```
 
 ## Map

@@ -2,6 +2,11 @@
 name = "brim"
 version = "0.1.0"
 edition = "2024"
+description = "Context-window occupancy diagnostic for AI coding-assistant sessions and their sub-agents"
+license = "MIT"
+repository = "https://github.com/petolofsson/brim"
+keywords = ["claude-code", "context-window", "llm", "diagnostic", "ai-coding"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"

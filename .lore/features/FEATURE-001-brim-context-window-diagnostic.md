@@ -13,12 +13,15 @@ related_adrs:
   - ADR-001
   - ADR-002
   - ADR-003
+  - ADR-014
 related_stories:
   - STORY-001
+  - STORY-006
 related_tests:
   - TEST-001
   - TEST-002
   - TEST-003
+  - TEST-005
 ---
 
 # FEATURE-001 - brim context-window diagnostic

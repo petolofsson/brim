@@ -1,18 +1,19 @@
 ---
 id: STORY-005
 title: Package and release brim v0.1.0
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
-related_adrs: []
+related_adrs:
+  - ADR-014
 related_stories: []
 related_tests: []
 ---
 
 # STORY-005 - Package and release brim v0.1.0
 
-> **Status: Draft — deferred future-work, scheduled 2026-06-24.**
-> Code is functionally complete; recorded now so release hygiene is not lost.
+> **Status: Accepted — shipped 2026-06-24 via ADR-014.**
+> Release-hygiene deliverables complete (LICENSE MIT, Cargo.toml metadata, README, ADR-014). The v0.1.0 git tag is the user's post-review release act, not a brim deliverable.
 
 ## User Story
 
@@ -46,11 +47,13 @@ mechanics above.
 
 ## Acceptance Criteria
 
-- [ ] A LICENSE file exists (MIT or Apache-2.0; decision recorded).
-- [ ] `Cargo.toml [package]` has `description`, `license`, `repository`, `keywords`,
+- [x] A LICENSE file exists (MIT or Apache-2.0; decision recorded).
+- [x] `Cargo.toml [package]` has `description`, `license`, `repository`, `keywords`,
       `categories`; `cargo publish --dry-run` accepts the metadata.
-- [ ] README.md documents all current CLI flags and matches the AGENTS.md router template.
+- [x] README.md documents all current CLI flags and matches the AGENTS.md router template.
 - [ ] v0.1.0 is tagged with release notes.
+
+> The v0.1.0 tag is the user's post-review release act, not a brim deliverable; hygiene work is complete (ADR-014).
 
 ## Related
 
