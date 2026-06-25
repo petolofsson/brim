@@ -209,3 +209,55 @@ Three independent validation sources were obtained; an honest gap remains.
     `projected_turns_to_recycle` was computed against the hardcoded 128k backstop
     instead of the configurable `--recycle-backstop` (REQ-004) at `claude.rs:170`,
     `codex.rs:338`, `opencode.rs:366`, `copilot.rs:134`. Fixed in a separate commit.
+
+## Roadmap / Future improvements
+
+Five improvements agreed 2026-06-25, ranked by value, flagged by cost. The first
+three keep the current invariant (deterministic, transcript-tokens-only); #4
+changes the REQ-005 JSON verdict contract; #5 abandons the transcript-only
+invariant outright.
+
+### Cheap — keeps the deterministic / transcript-tokens-only design
+
+1. **Learn the real context ceiling from compaction events.** brim already
+   detects host auto-compaction as an occupancy drop in the timeline (the reset
+   index $s$ in *Trend*). Reuse that point as an observed estimate of *this*
+   agent's true window on its current plan. Use it for an **honest occupancy %
+   display only — NOT to scale thresholds**: per ADR-011 degradation is ~absolute
+   for reasoning/agentic work, so a bigger window just means more room to bloat
+   past the anchor, not a higher anchor. No model→window table, no manual entry,
+   works across providers. Today the displayed % is relative to the fixed 128k
+   backstop $B$.
+2. **Long-horizon drift signal.** The $K=8$ trend tail resets on every
+   compaction (scope gap **B**), so it catches fast local symptoms but misses
+   slow session-long drift. Add an EWMA / floor-trend over the full timeline
+   *across* resets. Stays token-only and deterministic.
+3. **Empirical calibration.** Anchors (watch $T_w$ / backstop $B$ and the
+   presentation tiers) are research-anchored, not tuned to observed sessions. Log
+   verdict-at-recycle-time vs whether recycling actually helped, then calibrate
+   anchors to outcomes.
+
+### Medium — changes the REQ-005 JSON verdict contract
+
+4. **Promote the 5 presentation tiers into the engine.** The recycle-advisory
+   recipe renders 5 severity stages (lean / drift / bloated / stale / critical)
+   but these live ONLY in the example scripts as a presentation layer over the
+   3-value engine verdict (`ok | nearing | over_recycle`); stages 4–5 are
+   pure-occupancy because the engine enum saturates at `over_recycle`. Promoting
+   to a 5-level verdict in REQ-005 + a new ADR would make the tiers
+   machine-readable for any consumer and let velocity/cache-thrash refine
+   stale-vs-critical above the backstop. Marginal decision-value; do only when a
+   second consumer exists.
+
+### Deep — BREAKS the deterministic / transcript-only invariant
+
+5. **Actually measure bloat instead of proxying it.** Today a big-and-useful
+   context and a big-and-bloated one are indistinguishable to brim (token counts
+   can't see staleness) — scope gap **A**. A real measure requires content
+   inspection (semantic analysis or an LLM-judge) to detect stale/repeated tool
+   output, dead-end attempts, superseded code. Highest ceiling, heaviest
+   architectural cost; abandons the transcript-tokens-only invariant. A different
+   product — decide deliberately, not a next step.
+
+**Sequencing:** #1 and #3 first (low-risk sharpening); #2 to close the slow-drift
+blind spot (gap B); #4 only on a second consumer; #5 as a deliberate fork.
