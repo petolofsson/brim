@@ -23,17 +23,17 @@ This example targets Claude Code's Stop-hook + statusline JSON contract specific
 
 The recipe drives three consumer surfaces from the host (never the agent):
 
-- **Statusline (ambient)** — a statusline command runs `brim --session <session_id> --json`, parses it in-shell, and renders the parent session's occupancy/verdict. Always-on, zero context cost.
+- **Statusline (ambient)** — a statusline command runs `brim --session <session_id> --json`, parses it in-shell, and renders the parent session's occupancy% plus a 5-stage severity bucket (lean / drift / bloated / stale / critical) derived as `max(occupancy_stage, verdict_stage)`. Always-on, zero context cost. The 5 stages are a recipe-only presentation layer over brim's 3-value engine verdict (`ok | nearing | over_recycle`); see roadmap item #4 in `docs/recycle-verdict-model.md`.
 - **Desktop notification** — a host Stop hook fires an OS notification on escalation into Over.
 - **One-line agent nudge** — the same Stop hook returns a single advisory line via `additionalContext`, the only path by which the advisory touches the loop, and only on transition into Over.
 
 ## Recipe behavior
 
 - **Out of conversation** — brim is invoked only by the host (Stop hook + statusline command); its JSON is parsed in-shell and never enters the conversation. The agent never runs brim itself.
-- **Over** — emit a one-line agent nudge (Stop hook `additionalContext`) plus a desktop notification, debounced per session to fire only on transition into Over (sticky-Over, ADR-022).
-- **Nearing** — surfaces on the statusline only; no context injection.
+- **Over** — emit a one-line agent nudge (Stop hook `additionalContext`) plus a desktop notification, debounced per session to fire only on transition into Over (sticky-Over, ADR-022). A SINGLE alert on entry into Over (stage ≥ 3); no re-notify on later escalation into stale/critical. Nudge/notify text is stage-specific (bloated ~128k+ / stale ~256k+ / critical ~512k+).
+- **Nearing** — surfaces on the statusline only (drift band); no context injection.
 - **Verdict scope** — the parent session's OWN window via `brim --session <session_id>`, not the subtree `worst_verdict`.
-- **Thresholds** — brim's defaults `--watch-tokens 32000` / `--recycle-backstop 128000`, no override.
+- **Thresholds** — recipe passes `--watch-tokens 96000` (the green/lean band ends at 75% of the 128k backstop); the `--recycle-backstop 128000` default is unchanged. The override uses brim's existing configurable flag (REQ-004); 32k watch cries wolf in real agentic sessions, which run far past it.
 
 ## Included Artifacts
 
@@ -44,7 +44,7 @@ The recipe drives three consumer surfaces from the host (never the agent):
 ## Scope
 
 - Example scripts (statusline command, Stop hook) and documentation shipped IN the brim repo as a host-specific integration example.
-- Consumes brim's existing `--session` / `--json` contract (REQ-005) and brim's default thresholds.
+- Consumes brim's existing `--session` / `--json` / `--watch-tokens` contract (REQ-005, REQ-004): default 128k backstop with a `--watch-tokens 96000` override.
 
 ## Out of Scope (non-goals)
 
@@ -59,6 +59,6 @@ The recipe drives three consumer surfaces from the host (never the agent):
 Implemented in `examples/claude-code/`:
 
 - `brim-stop-hook.sh` — Stop hook: one-line agent nudge (`additionalContext`) + desktop notification on transition into Over (REQ-010, REQ-015).
-- `brim-statusline.sh` — statusline command: ambient occupancy% + verdict.
+- `brim-statusline.sh` — statusline command: ambient occupancy% + 5-stage severity bucket.
 - `settings.snippet.json` — paste-safe Claude Code `settings.json` wiring.
 - `README.md` — the recipe (install, three surfaces, cadence, caveats).

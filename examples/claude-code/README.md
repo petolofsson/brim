@@ -9,12 +9,42 @@ context, and the agent never runs brim itself. (FEATURE-003.)
 
 | Surface | When | Cost to context |
 |---|---|---|
-| **Statusline** — ambient occupancy% + verdict (`ok` / `nearing` / `over`) | every render | zero |
-| **Desktop notification** (`notify-send`) | transition into `over` only, debounced per session | zero |
-| **One-line agent nudge** (Stop hook `additionalContext`) | transition into `over` only, debounced per session | one line, only on `over` |
+| **Statusline** — `◈ brim <5-block bar> <occ>% <label>`, a 5-stage severity bucket | every render | zero |
+| **Desktop notification** (`notify-send`) | transition into `over` (stage ≥ 3) only, debounced per session | zero |
+| **One-line agent nudge** (Stop hook `additionalContext`) | transition into `over` (stage ≥ 3) only, debounced per session | one line, only on `over` |
 
 The nudge is the **only** path by which the advisory touches the loop, and only
-on the first turn that crosses into `over` (sticky debounce, per session).
+on the first turn that crosses into `over` (sticky debounce, per session). It
+fires a **single** alert on entry into `over` — there is **no** re-notify when
+the session later escalates into `stale`/`critical` (deliberate).
+
+## Statusline: the 5-stage bar
+
+The statusline renders `◈ brim <bar> <occ>% <label>`, where the bar is 5 blocks
+filled to the current stage (`■`) and padded (`□`). `occ` =
+`floor(window_tokens × 100 / 128000)` — occupancy as a percentage of the 128k
+backstop; it **can exceed 100%** once the window grows past the backstop.
+
+The stage is `max(occupancy_stage, verdict_stage)` — **worst-of-both wins**. A
+burst can trip the engine's `over_recycle` verdict (≥ stage 3) even at low
+occupancy, and high occupancy wins even when the engine is calm:
+
+| Stage | Bar | Label | Color | occupancy band | verdict |
+|---|---|---|---|---|---|
+| 1 | `■□□□□` | `lean` | green | `< 75%` | `ok` |
+| 2 | `■■□□□` | `drift` | yellow | `75–99%` | `nearing` |
+| 3 | `■■■□□` | `bloated` | orange | `100–199%` | `over_recycle` |
+| 4 | `■■■■□` | `stale` | red | `200–399%` | — |
+| 5 | `■■■■■` | `critical` | red-bold | `≥ 400%` | — |
+
+Stages 4–5 are pure-occupancy: the engine verdict saturates at `over_recycle`
+(stage 3), so only occupancy escalates above it. The 5 stages are a recipe-only
+presentation layer over brim's 3-value engine verdict; promoting them into the
+engine is tracked as roadmap item #4 in `docs/recycle-verdict-model.md`.
+
+Stage 1 (`lean`, green) is the ambient `ok` render — the quiet steady state
+(REQ-010). The nudge/notify text is stage-specific: `bloated` (~128k+),
+`stale` (~256k+), `critical` (~512k+).
 
 ## Install
 
@@ -66,11 +96,13 @@ Critical wiring notes:
 
 ## Config & caveats
 
-- **Thresholds are brim's defaults**: `--watch-tokens 32000` /
-  `--recycle-backstop 128000`. `nearing` fires at 32k, so on a large host window
-  the statusline reads `nearing` for most of a session — **`over` (128k) is the
-  actionable state.** Raise `--watch-tokens` in the scripts if you want a
-  quieter statusline.
+- **Thresholds**: the scripts pass `--watch-tokens 96000`; the
+  `--recycle-backstop 128000` default is unchanged. brim's default watch is
+  `32000`, but `nearing` at 32k cries wolf — real agentic sessions run far past
+  it — so the recipe ends the green/`lean` band at 75% of the 128k backstop
+  (96k). `occ%` is measured against the 128k backstop and **exceeds 100%** once
+  the window grows past it. Lower `--watch-tokens` for an earlier `drift`
+  warning, or raise it for a quieter statusline.
 - **`BRIM_NO_NOTIFY=1`** suppresses desktop notifications. Useful for testing:
   running the Stop hook fires a real `notify-send`.
 - **Host-schema drift.** This targets Claude Code's *current* hook/statusline

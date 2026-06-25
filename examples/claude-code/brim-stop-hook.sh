@@ -20,9 +20,9 @@ esac
 # --- query brim for own-session verdict ---
 # REQ-015: timeout guard — prevents a hung brim from stalling the turn
 if command -v timeout >/dev/null 2>&1; then
-    brim_out=$(timeout 5 brim --session "$session_id" --json 2>/dev/null)
+    brim_out=$(timeout 5 brim --session="$session_id" --watch-tokens 96000 --json 2>/dev/null)
 else
-    brim_out=$(brim --session "$session_id" --json 2>/dev/null)
+    brim_out=$(brim --session="$session_id" --watch-tokens 96000 --json 2>/dev/null)
 fi
 v=$(printf '%s' "$brim_out" | jq -r '.nodes[0].verdict // empty' 2>/dev/null)
 if [ -z "$v" ]; then
@@ -46,19 +46,34 @@ if [ "$v" != "over_recycle" ] || [ "$prior" = "over_recycle" ]; then
     exit 0
 fi
 
-# --- transition INTO over: compute occupancy for the message ---
+# --- transition INTO over: compute occupancy and stage for message ---
 tokens=$(printf '%s' "$brim_out" | jq '.nodes[0].window_tokens // 0' 2>/dev/null)
 occupancy=$(printf '%s' "$tokens" | awk '{printf "%d", ($1 * 100 / 128000)}')
 
+# stage 3/4/5 (verdict=over_recycle → floor at 3; occ drives escalation)
+if   [ "$occupancy" -ge 400 ]; then stage=5
+elif [ "$occupancy" -ge 200 ]; then stage=4
+else                                 stage=3
+fi
+
+case "$stage" in
+    5) nudge_msg='brim: context critical (~512k+) — recycle now.'
+       notify_msg='context critical (~512k+) — recycle now' ;;
+    4) nudge_msg='brim: context stale (~256k+) — start a fresh session.'
+       notify_msg='context stale (~256k+) — start a fresh session' ;;
+    *) nudge_msg='brim: context bloated (~128k+) — recycle recommended.'
+       notify_msg='context bloated (~128k+) — recycle recommended' ;;
+esac
+
 # --- emit one-line agent nudge via additionalContext (jq -n is injection-safe) ---
 jq -n \
-    --arg msg "brim: context window ${occupancy}% full (over budget) — wrap up this thread and start a new session to avoid hard compaction." \
+    --arg msg "$nudge_msg" \
     '{hookSpecificOutput:{hookEventName:"Stop",additionalContext:$msg}}'
 
 # --- optional desktop notification (guarded; absence of notify-send is harmless) ---
 # Set BRIM_NO_NOTIFY=1 to suppress notifications (e.g. dry-runs or automated tests)
 if [ -z "${BRIM_NO_NOTIFY:-}" ] && command -v notify-send >/dev/null 2>&1; then
-    notify-send 'brim' "context over budget (${occupancy}%) — wrap up and recycle" 2>/dev/null || true
+    notify-send 'brim' "$notify_msg" 2>/dev/null || true
 fi
 
 exit 0
