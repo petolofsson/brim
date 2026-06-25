@@ -110,6 +110,7 @@ fn parse_session_dir(dir: &Path, log_root: &Path, backstop: u64) -> Option<Sessi
         children: Vec::new(),
         last_turn_at,
         trend,
+        tool_repeat_run: None,
     })
 }
 

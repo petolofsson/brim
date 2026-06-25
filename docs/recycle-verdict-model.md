@@ -261,3 +261,28 @@ invariant outright.
 
 **Sequencing:** #1 and #3 first (low-risk sharpening); #2 to close the slow-drift
 blind spot (gap B); #4 only on a second consumer; #5 as a deliberate fork.
+
+### Realization path (lore)
+
+The behavioral-degradation work is now formalized in lore as the realization
+path for the cheap/medium roadmap items:
+
+- **STORY-012** — operator intent: warn on a STUCK / SPINNING context (looping,
+  failing tool calls, unproductive growth), not only on raw token volume; and
+  sharpen the warning stages by draining transcript signals brim already parses
+  but discards.
+- **REQ-016** — *Candidate verdict-signal variables*: the Tier A / Tier B / Tier
+  C catalog as the candidate signal set (source field, what it predicts, verdict
+  use, cross-provider availability). Tier A signals (incl. **compaction-drop
+  magnitude** → #1, and the cross-reset trend inputs → #2) keep the invariant;
+  Tier B realizes ADR-010 signal (a) without eval probing; Tier C is the #5 fork.
+- **ADR-024** *(Draft)* — *Behavioral degradation gate from tool-call structure*:
+  extends (does NOT supersede) ADR-010 by un-deferring signal (a) as a
+  deterministic behavioral gate; closes the stage-4/5 (stale vs critical)
+  pure-occupancy blindness.
+
+Mapping to the items above: REQ-016's compaction-drop-magnitude signal realizes
+**#1 (drop-magnitude ceiling)**; its cross-reset trajectory inputs feed **#2
+(long-horizon drift)**; ADR-024's separate-behavioral-axis option is the path to
+**#4 (promote the 5 tiers into the engine)**. Anchors stay candidates pending
+**#3 (empirical calibration)** — none is asserted as accepted fact.

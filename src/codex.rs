@@ -105,6 +105,7 @@ fn parse_session_file(path: &Path, backstop: u64) -> Option<SessionNode> {
         children: Vec::new(),
         last_turn_at,
         trend,
+        tool_repeat_run: None,
     })
 }
 

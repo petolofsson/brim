@@ -206,6 +206,7 @@ pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
                 children: Vec::new(),
                 last_turn_at,
                 trend,
+                tool_repeat_run: None,
             },
         ));
     }

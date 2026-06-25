@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -49,10 +50,12 @@ struct TurnData {
     cache_create: u64,
     model: String,
     ts: Option<DateTime<Utc>>,
+    tool_calls: Vec<(String, u64)>,
 }
 
 /// Scan the tail of a JSONL transcript, collect the last TREND_TAIL_K assistant turns,
-/// and return the last-turn WindowInfo, its timestamp, and the velocity trend.
+/// and return the last-turn WindowInfo, its timestamp, the velocity trend, and the
+/// PROVISIONAL/spike tool-call repetition run length (ADR-024).
 fn parse_transcript(
     path: &Path,
     backstop: u64,
@@ -60,10 +63,11 @@ fn parse_transcript(
     Option<WindowInfo>,
     Option<DateTime<Utc>>,
     Option<WindowTrend>,
+    Option<u32>,
 ) {
     let text = match read_tail(path) {
         Ok(t) => t,
-        Err(_) => return (None, None, None),
+        Err(_) => return (None, None, None, None),
     };
 
     // Collect all valid (non-zero-usage) assistant turns from the tail.
@@ -114,12 +118,36 @@ fn parse_transcript(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // PROVISIONAL/spike per ADR-024: extract tool_use blocks (structure only; input is hashed,
+        // never stored or logged — CODERULES r11).
+        let tool_calls: Vec<(String, u64)> = msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|block| {
+                        if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                            return None;
+                        }
+                        let name = block.get("name").and_then(|v| v.as_str())?.to_string();
+                        let input_val = block.get("input").unwrap_or(&Value::Null);
+                        let canonical = serde_json::to_string(input_val).unwrap_or_default();
+                        let mut hasher = DefaultHasher::new();
+                        canonical.hash(&mut hasher);
+                        Some((name, hasher.finish()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         turns.push(TurnData {
             input,
             cache_read,
             cache_create,
             model,
             ts: ts_opt,
+            tool_calls,
         });
     }
 
@@ -129,12 +157,36 @@ fn parse_transcript(
     }
 
     if turns.is_empty() {
-        return (None, None, None);
+        return (None, None, None, None);
     }
+
+    // PROVISIONAL/spike per ADR-024: max run of consecutive identical (name, input_hash)
+    // tool calls across the tail window. None when window has no tool_use traffic.
+    let tool_repeat_run: Option<u32> = {
+        let all_calls: Vec<&(String, u64)> =
+            turns.iter().flat_map(|t| t.tool_calls.iter()).collect();
+        if all_calls.is_empty() {
+            None
+        } else {
+            let mut max_run: u32 = 1;
+            let mut cur_run: u32 = 1;
+            for i in 1..all_calls.len() {
+                if all_calls[i] == all_calls[i - 1] {
+                    cur_run = cur_run.saturating_add(1);
+                    if cur_run > max_run {
+                        max_run = cur_run;
+                    }
+                } else {
+                    cur_run = 1;
+                }
+            }
+            if max_run >= 2 { Some(max_run) } else { None }
+        }
+    };
 
     // Last valid turn → WindowInfo. Timestamp bound to this turn only (B1).
     let Some(last) = turns.last() else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let window_info = compute_window_info(
         last.input,
@@ -172,7 +224,7 @@ fn parse_transcript(
         None
     };
 
-    (Some(window_info), last_ts, trend)
+    (Some(window_info), last_ts, trend, tool_repeat_run)
 }
 
 fn agent_id_from_stem(stem: &str) -> Option<String> {
@@ -217,7 +269,7 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
 
     for (_, name, path) in jsonl_files {
         let uuid = name.trim_end_matches(".jsonl").to_string();
-        let (window, last_turn_at, trend) = parse_transcript(&path, backstop);
+        let (window, last_turn_at, trend, tool_repeat_run) = parse_transcript(&path, backstop);
         parents.push(SessionNode {
             session_uuid: uuid,
             agent_id: None,
@@ -226,6 +278,7 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
             children: Vec::new(),
             last_turn_at,
             trend,
+            tool_repeat_run,
         });
     }
 
@@ -262,7 +315,8 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
                     continue;
                 }
                 let agent_id = agent_id_from_stem(sub_stem);
-                let (window, last_turn_at, trend) = parse_transcript(&sub_path, backstop);
+                let (window, last_turn_at, trend, tool_repeat_run) =
+                    parse_transcript(&sub_path, backstop);
                 children.push(SessionNode {
                     session_uuid: parent_uuid.clone(),
                     agent_id,
@@ -271,6 +325,7 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
                     children: Vec::new(),
                     last_turn_at,
                     trend,
+                    tool_repeat_run,
                 });
             }
             child_map.insert(parent_uuid, children);
@@ -676,6 +731,164 @@ mod tests {
                 "new file {name} should have been retained"
             );
         }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // PROVISIONAL/spike per ADR-024: tool_repeat_run == 3 when 3 identical tool_use calls.
+    #[test]
+    fn test_tool_repeat_run_identical_three() {
+        let tmp = std::env::temp_dir().join("brim_test_tool_repeat_3");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = "22220000-0000-0000-0000-000000000001";
+        // Three assistant turns, each emitting tool_use name="Bash" with identical input.
+        let tool_line = |ts: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"{ts}\",\"message\":{{\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}},\"content\":[{{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{{\"command\":\"ls\"}}}}]}}}}\n"
+            )
+        };
+        let jsonl = format!(
+            "{}{}{}",
+            tool_line("2026-06-25T10:00:00Z"),
+            tool_line("2026-06-25T10:01:00Z"),
+            tool_line("2026-06-25T10:02:00Z"),
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), &jsonl).unwrap();
+
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].tool_repeat_run,
+            Some(3),
+            "three identical Bash calls → run == 3"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // PROVISIONAL/spike per ADR-024: tool_repeat_run == 1 when tool_use calls differ.
+    #[test]
+    fn test_tool_repeat_run_differing_calls() {
+        let tmp = std::env::temp_dir().join("brim_test_tool_repeat_diff");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = "22220000-0000-0000-0000-000000000002";
+        // Three assistant turns with different inputs — no run > 1.
+        let lines = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"/foo\"}}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:02:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"pwd\"}}]}}\n",
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), lines).unwrap();
+
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].tool_repeat_run, None,
+            "all different tool calls → max run < 2 → field absent"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // PROVISIONAL/spike per ADR-024: tool_repeat_run absent when no tool_use in window.
+    #[test]
+    fn test_tool_repeat_run_absent_when_no_tool_use() {
+        let tmp = std::env::temp_dir().join("brim_test_tool_repeat_none");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = "22220000-0000-0000-0000-000000000003";
+        // Assistant turns with no content / no tool_use blocks.
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n",
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].tool_repeat_run, None,
+            "no tool_use → field absent"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // PROVISIONAL/spike per ADR-024: two identical tool_use blocks in ONE assistant turn → run == 2.
+    #[test]
+    fn test_tool_repeat_run_two_identical_in_one_turn() {
+        let tmp = std::env::temp_dir().join("brim_test_tool_repeat_same_turn");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = "22220000-0000-0000-0000-000000000004";
+        // Single turn whose content has [Bash(ls), Bash(ls)] → flattened run of 2.
+        let jsonl = "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}},{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n";
+        fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].tool_repeat_run,
+            Some(2),
+            "two identical Bash calls in one turn → run == 2"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // PROVISIONAL/spike per ADR-024: run spanning a turn boundary → run == 2.
+    #[test]
+    fn test_tool_repeat_run_spanning_turn_boundary() {
+        let tmp = std::env::temp_dir().join("brim_test_tool_repeat_boundary");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = "22220000-0000-0000-0000-000000000005";
+        // Turn1: [Read(a), Bash(x)]; Turn2: [Bash(x)] → consecutive Bash(x) across boundary → run 2.
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"/a\"}},{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"x\"}}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"x\"}}]}}\n",
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].tool_repeat_run,
+            Some(2),
+            "Bash(x) at end of turn1 + Bash(x) start of turn2 → run == 2"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // PROVISIONAL/spike per ADR-024: same args hash but different tool name must NOT merge.
+    #[test]
+    fn test_tool_repeat_run_same_args_different_tool_no_merge() {
+        let tmp = std::env::temp_dir().join("brim_test_tool_repeat_diff_tool");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = "22220000-0000-0000-0000-000000000006";
+        // Read({path:X}) then Bash({path:X}): same input hash, different name → no run > 1.
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"/x\"}}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"path\":\"/x\"}}]}}\n",
+        );
+        fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].tool_repeat_run, None,
+            "same args but different tool names must not merge → max run < 2 → field absent"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

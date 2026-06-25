@@ -351,6 +351,9 @@ pub struct SessionNode {
     pub last_turn_at: Option<DateTime<Utc>>,
     /// Velocity/projection trend from the last K turns (ADR-006). None if unavailable.
     pub trend: Option<WindowTrend>,
+    /// PROVISIONAL/spike per ADR-024: max consecutive-identical (tool_name, args_hash) run
+    /// across the tail window. None when no tool_use blocks in the window.
+    pub tool_repeat_run: Option<u32>,
 }
 
 #[cfg(test)]
@@ -376,6 +379,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         }
     }
 

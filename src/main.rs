@@ -231,6 +231,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at,
             trend: None,
+            tool_repeat_run: None,
         }
     }
 
@@ -285,6 +286,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: Some(Utc::now() - chrono::Duration::minutes(5)),
             trend: None,
+            tool_repeat_run: None,
         };
         let parent = SessionNode {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
@@ -299,6 +301,7 @@ mod tests {
             children: vec![child],
             last_turn_at: Some(Utc::now() - chrono::Duration::hours(2)),
             trend: None,
+            tool_repeat_run: None,
         };
         let mut sessions = vec![parent];
         sessions.retain(|s| any_active(s, 30));
@@ -353,6 +356,7 @@ mod tests {
                 velocity_tokens_per_turn: velocity,
                 projected_turns_to_recycle: Some(p),
             }),
+            tool_repeat_run: None,
         }
     }
 

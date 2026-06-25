@@ -97,6 +97,10 @@ pub(crate) struct JsonNode {
     /// Set for root nodes only; null for child nodes.
     #[serde(skip_serializing_if = "Option::is_none")]
     recycle_recommendation: Option<JsonRecycleRecommendation>,
+    /// PROVISIONAL/spike per ADR-024: max consecutive-identical tool-call run in the tail window.
+    /// Absent when no tool_use traffic in the window (ADR-013 slim contract unchanged when quiet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_repeat_run: Option<u32>,
     children: Vec<JsonNode>,
 }
 
@@ -187,6 +191,7 @@ pub(crate) fn to_json_node(
         trend,
         subtree,
         recycle_recommendation: rec,
+        tool_repeat_run: node.tool_repeat_run,
         children: node
             .children
             .iter()
@@ -463,6 +468,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
 
         let parent = SessionNode {
@@ -479,6 +485,7 @@ mod tests {
             children: vec![child],
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
 
         let parent_si = compute_subtree(&parent, &thresholds);
@@ -521,6 +528,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -556,6 +564,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -595,6 +604,7 @@ mod tests {
                 velocity_tokens_per_turn: Some(10_000),
                 projected_turns_to_recycle: Some(10),
             }),
+            tool_repeat_run: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -628,6 +638,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
         // root with window + trend (so subtree aggregates and recycle rec populate)
         let parent = SessionNode {
@@ -643,6 +654,7 @@ mod tests {
             children: vec![child],
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
 
         let parent_si = compute_subtree(&parent, &thresholds);
@@ -774,6 +786,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
         // active root with known window_tokens.
         let root = SessionNode {
@@ -789,6 +802,7 @@ mod tests {
             children: vec![no_window_child],
             last_turn_at: None,
             trend: None,
+            tool_repeat_run: None,
         };
 
         let si = compute_subtree(&root, &thresholds);
