@@ -1,10 +1,10 @@
 ---
 id: STORY-011
 title: Warn me to recycle before the host hard-compacts, without spending conversation tokens
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-003
-related_adrs: [ADR-011]
+related_adrs: [ADR-011, ADR-026]
 related_stories: []
 related_tests: []
 ---
@@ -25,3 +25,7 @@ So that I act ahead of the auto-compaction net (ADR-011) without spending conver
 - [ ] The advisory is scoped to my parent session's own window, so heavy sub-agent calls do not false-alarm (FEATURE-003).
 - [ ] The check runs entirely host-side; brim's JSON never enters my conversation, so the warning costs no context (FEATURE-003).
 - [ ] If brim is missing or errors, my turn proceeds unaffected — nothing is emitted and nothing is blocked (REQ-015).
+
+## Acceptance Note
+
+Accepted: satisfied by ADR-026 amendment M1 — `occupancy >= recycle_backstop` is a decisive Over override that bypasses the family count. This guarantees a warning before host hard-compaction even on behavior-blind providers (copilot, opencode read `behavior:None`), closing the floor this story requires.

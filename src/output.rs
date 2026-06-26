@@ -818,6 +818,52 @@ mod tests {
         assert!(!json_str.contains("content"));
     }
 
+    // REQ-010: on ok verdict, JSON emits verdict="ok", tier="lean", no recycle_recommendation.
+    // The Stop hook filters on tier ∈ {bloated,stale,critical} to emit additionalContext;
+    // lean tier must be absent so the hook exits 0 silently.
+    #[test]
+    fn test_ok_verdict_silent_contract() {
+        let thresholds = Thresholds::default();
+        // window_tokens well below ABSOLUTE_WATCH_TOKENS (32k) → all families silent → Lean → Ok
+        let node = SessionNode {
+            session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
+            agent_id: None,
+            project_key: "test".to_string(),
+            window: Some(WindowInfo {
+                window_tokens: 5_000,
+                model: "claude-sonnet-4-6".to_string(),
+                window_source: WindowSource::LastTurn,
+                cache_hit_ratio: None,
+            }),
+            children: Vec::new(),
+            last_turn_at: None,
+            trend: None,
+            behavior: None,
+        };
+        let si = compute_subtree(&node, &thresholds);
+        let jnode = to_json_node(&node, &si, None, &thresholds, 30, None);
+
+        assert_eq!(jnode.verdict, Some("ok"), "ok verdict");
+        assert_eq!(jnode.tier, Some("lean"), "tier=lean on ok");
+        assert_eq!(jnode.verdict_gate, None, "no gate on ok");
+        assert!(
+            jnode.recycle_recommendation.is_none(),
+            "no recycle_recommendation on ok"
+        );
+
+        let json_str = serde_json::to_string(&jnode).unwrap();
+        // hook reads tier; lean must not appear as bloated/stale/critical
+        assert!(json_str.contains("\"lean\""), "tier=lean in JSON");
+        assert!(!json_str.contains("\"bloated\""), "not bloated");
+        assert!(!json_str.contains("\"stale\""), "not stale");
+        assert!(!json_str.contains("\"critical\""), "not critical");
+        // recycle_recommendation absent from serialized output (skip_serializing_if = None)
+        assert!(
+            !json_str.contains("\"recycle_recommendation\""),
+            "recycle_recommendation absent from JSON on ok"
+        );
+    }
+
     // TEST-005: brim --json node contract matches absolute-tokens field set.
     #[test]
     fn test_json_contract_test005() {

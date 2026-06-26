@@ -59,12 +59,17 @@ Behavioral signals were initially assumed Claude-only. That was a **brim-parsing
 not a format absence — brim's codex/copilot/opencode parsers only ever extracted occupancy.
 Verified availability of tool-call STRUCTURE (name, args, error flag, ordering):
 
-| Provider | Tool structure | Error discriminator | Args | Notes |
-|---|---|---|---|---|
-| **Claude** | Yes (live data) | `is_error` boolean | object | Fully implemented |
-| **codex** | Yes (spec-derived, no local data) | `function_call_output.status='failed'` | JSON **string** (parse before hash) | `~/.codex` absent on machine |
-| **opencode** | Yes (verified, 1.17.9) | `state.status='error'` | JSON **object** | step-finish in `part`; `session_message` present but unused; token shape verified |
-| **copilot** | **No** — process-log source carries no tool structure | — | — | Behavior family can never fire |
+**FORMAT-available ≠ WIRED-in-brim.** The "Tool structure (format)" column states whether the
+provider's transcript *exposes* the tool-block structure the Behavior family needs; the "Wired in
+brim?" column states whether brim's parser actually *extracts* it. A provider can have the format
+yet stub `behavior:None`, in which case its Behavior family can never fire regardless of format.
+
+| Provider | Tool structure (format) | Wired in brim? | Error discriminator | Args | Notes |
+|---|---|---|---|---|---|
+| **Claude** | Yes (live data) | **Yes** (`claude.rs`) | `is_error` boolean | object | Fully implemented |
+| **codex** | Yes (spec-derived, no local data) | **Yes** (`codex.rs:98`) | `function_call_output.status='failed'` | JSON **string** (parse before hash) | `~/.codex` absent on machine |
+| **opencode** | Yes (verified, 1.17.9) | **No — stub** (`opencode.rs:211` `behavior:None`) | `state.status='error'` | JSON **object** | format present but NOT consumed; Behavior family can never fire until wired; step-finish in `part`; token shape verified |
+| **copilot** | **No** — process-log source carries no tool structure | **No** (`copilot.rs:113` `behavior:None`) | — | — | neither format nor wiring; Behavior family can never fire |
 
 Key gotchas baked into the design: **no provider uses a uniform boolean `is_error`** (status
 discriminators); **codex args are a string, opencode/Claude args are objects** (string needs

@@ -180,6 +180,10 @@ algorithm that consumes the labels (out of scope — a separate later unit).
       is unchanged — this requirement produces labels for offline calibration
       only; consuming them is out of scope.
 
+## Test Coverage
+
+No test yet: the harvester is unbuilt. Test deferred until the harvester is implemented.
+
 <!-- Produces the LOCAL-capture calibration corpus named in ADR-025
 [[ADR-025]]; serves STORY-013 [[STORY-013]]. PRIMARY label = operator recycle
 event (positive target); SECONDARY = host compaction (negative wall-hit);

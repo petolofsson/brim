@@ -102,6 +102,10 @@ territory — a different product, a deliberate fork).
 - [ ] No threshold is asserted as accepted fact — all anchors are candidates
       pending calibration (Roadmap #3).
 
+## Test Coverage
+
+No behavioral test: this is a planning/catalog artifact (candidate signal set), not a shipped behavior. Nothing to assert at runtime.
+
 <!-- Catalog for the decision in ADR "Behavioral degradation gate from
 tool-call structure" [[ADR-010]]; serves STORY-012 [[STORY-012]]; refines the
 verdict bands of REQ-004 (lore does not support req<->req links, so REQ-004 is

@@ -28,3 +28,7 @@ The advisory is best-effort and strictly additive. A health check must never bec
 - [ ] When `--session <id>` matches no session, the hook emits nothing and exits 0.
 - [ ] The Stop hook never returns a blocking/deny decision based on the brim check.
 - [ ] The statusline command renders empty/neutral (not an error) on any failure.
+
+## Test Coverage
+
+No Rust unit test: this behavior is verified by the shell Stop-hook recipe (`examples/claude-code/brim-stop-hook.sh`), which owns the fail-closed/exit-0 path. Not Rust-unit-testable.
