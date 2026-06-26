@@ -158,6 +158,7 @@ pub(crate) fn to_json_node(
         let inputs = FamilyVoteInputs {
             window_tokens: w.window_tokens,
             watch_tokens: thresholds.watch_tokens,
+            recycle_backstop: thresholds.recycle_backstop,
             projected_turns,
             sustained_cache_thrash: thrash,
             behavior: node.behavior.as_ref(),
@@ -303,6 +304,7 @@ pub(crate) fn verdict_str(node: &SessionNode, thresholds: &Thresholds) -> String
     let inputs = FamilyVoteInputs {
         window_tokens: w.window_tokens,
         watch_tokens: thresholds.watch_tokens,
+        recycle_backstop: thresholds.recycle_backstop,
         projected_turns,
         sustained_cache_thrash: thrash,
         behavior: node.behavior.as_ref(),
@@ -576,9 +578,9 @@ mod tests {
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
-        // 190k >= ABSOLUTE_WATCH_TOKENS (32k) → volume fires (1 family) → Nearing via abs-watch gate (ADR-025)
-        assert_eq!(jnode.verdict, Some("nearing"));
-        assert_eq!(jnode.verdict_gate, Some("absolute_watch"));
+        // 190k >= ABSOLUTE_RECYCLE_BACKSTOP (128k) → decisive_override → Over (ADR-025 FIX 1)
+        assert_eq!(jnode.verdict, Some("over_recycle"));
+        assert_eq!(jnode.verdict_gate, Some("decisive_override"));
     }
 
     #[test]
@@ -724,8 +726,9 @@ mod tests {
         // root window present → window_tokens/verdict/verdict_gate/window_source/model emitted.
         assert!(node.get("window_tokens").is_some());
         assert!(node.get("verdict").is_some());
-        assert_eq!(node["verdict"], "nearing");
-        assert_eq!(node["verdict_gate"], "absolute_watch");
+        // 190k >= ABSOLUTE_RECYCLE_BACKSTOP (128k) → decisive_override → over_recycle (ADR-025 FIX 1)
+        assert_eq!(node["verdict"], "over_recycle");
+        assert_eq!(node["verdict_gate"], "decisive_override");
 
         // (iii) nested keys are the short names (ADR-013 rename map).
         let sub = &node["subtree"];

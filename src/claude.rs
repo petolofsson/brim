@@ -52,6 +52,9 @@ struct TurnData {
     model: String,
     ts: Option<DateTime<Utc>>,
     tool_calls: Vec<(String, u64)>,
+    /// tool_result error flags from human turns preceding this assistant turn.
+    error_flags: Vec<bool>,
+    stop_reason_max_tokens: bool,
 }
 
 /// Scan the tail of a JSONL transcript, collect the last TREND_TAIL_K assistant turns,
@@ -73,8 +76,6 @@ fn parse_transcript(
 
     // Collect all valid (non-zero-usage) assistant turns from the tail.
     let mut turns: Vec<TurnData> = Vec::new();
-    let mut error_flags: Vec<bool> = Vec::new();
-    let mut stop_reason_max_tokens = false;
 
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -87,7 +88,7 @@ fn parse_transcript(
         let turn_type = obj.get("type").and_then(|v| v.as_str());
 
         if turn_type == Some("human") || turn_type == Some("user") {
-            // collect tool_result error flags for BehaviorSignals
+            // Attribute tool_result errors to the preceding assistant turn.
             if let Some(content) = obj
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -99,7 +100,9 @@ fn parse_transcript(
                             .get("is_error")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        error_flags.push(is_error);
+                        if let Some(last_turn) = turns.last_mut() {
+                            last_turn.error_flags.push(is_error);
+                        }
                     }
                 }
             }
@@ -145,10 +148,8 @@ fn parse_transcript(
             .unwrap_or("")
             .to_string();
 
-        // Check stop_reason=max_tokens (Thrash/decisive signal, ADR-025)
-        if msg.get("stop_reason").and_then(|v| v.as_str()) == Some("max_tokens") {
-            stop_reason_max_tokens = true;
-        }
+        let stop_reason_max_tokens =
+            msg.get("stop_reason").and_then(|v| v.as_str()) == Some("max_tokens");
 
         // Extract tool_use blocks (structure only; input is hashed, never stored — CODERULES r11).
         let tool_calls: Vec<(String, u64)> = msg
@@ -178,6 +179,8 @@ fn parse_transcript(
             model,
             ts: ts_opt,
             tool_calls,
+            error_flags: Vec::new(),
+            stop_reason_max_tokens,
         });
     }
 
@@ -230,10 +233,16 @@ fn parse_transcript(
         None
     };
 
+    // Collect behavior signals bounded to the last TREND_TAIL_K turns.
     let all_calls: Vec<(String, u64)> = turns
         .iter()
         .flat_map(|t| t.tool_calls.iter().cloned())
         .collect();
+    let error_flags: Vec<bool> = turns
+        .iter()
+        .flat_map(|t| t.error_flags.iter().copied())
+        .collect();
+    let stop_reason_max_tokens = turns.iter().any(|t| t.stop_reason_max_tokens);
     let behavior_signals =
         BehaviorSignals::from_signals(&all_calls, &error_flags, stop_reason_max_tokens);
 

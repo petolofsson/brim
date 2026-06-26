@@ -29,25 +29,15 @@ if [ -z "$tier" ]; then
     exit 0  # REQ-015: brim error / no session / parse failure → silent, exit 0
 fi
 
-# --- per-session debounce: only fire on transition INTO over ---
-state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/brim"
-mkdir -p "$state_dir" 2>/dev/null || true
-state_file="$state_dir/last-$session_id"
-prior=""
-if [ -f "$state_file" ]; then
-    prior=$(cat "$state_file" 2>/dev/null)
-fi
-# If state_dir is unwritable, this silently fails; debounce degrades to 'may repeat'
-printf '%s' "$tier" > "$state_file" 2>/dev/null || true
-
-# REQ-010 + REQ-015: only fire on fresh transition into bloated/stale/critical (ADR-025 tier).
+# REQ-010 + REQ-015: only fire on bloated/stale/critical (ADR-025 tier).
 # Tier strings come from src/verdict.rs Tier::as_json_str — keep in sync.
 case "$tier" in
     bloated|stale|critical) ;;
-    *) exit 0 ;;
-esac
-case "$prior" in
-    bloated|stale|critical) exit 0 ;;  # already notified at this level or higher
+    *)
+        # Reset stored stage so a later re-escalation notifies (MEDIUM fix)
+        _sd="${XDG_STATE_HOME:-$HOME/.local/state}/brim"
+        printf '0\n' > "$_sd/last-$session_id" 2>/dev/null || true
+        exit 0 ;;
 esac
 
 # --- stage from tier (3=bloated, 4=stale, 5=critical) ---
@@ -56,6 +46,25 @@ case "$tier" in
     stale)    stage=4 ;;
     critical) stage=5 ;;
 esac
+
+# --- per-session debounce: fire only on escalation (current stage > last-notified stage) ---
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/brim"
+mkdir -p "$state_dir" 2>/dev/null || true
+state_file="$state_dir/last-$session_id"
+prior_stage=0
+if [ -f "$state_file" ]; then
+    read -r prior_stage < "$state_file" 2>/dev/null || prior_stage=0
+    # Validate: must be a non-negative integer; anything else resets to 0
+    case "$prior_stage" in
+        ''|*[!0-9]*) prior_stage=0 ;;
+    esac
+fi
+# If stage is same or lower than last-notified, suppress (already warned at this level or higher)
+if [ "$stage" -le "$prior_stage" ] 2>/dev/null; then
+    exit 0
+fi
+# Update stored stage; if unwritable debounce degrades to 'may repeat'
+printf '%s\n' "$stage" > "$state_file" 2>/dev/null || true
 
 case "$stage" in
     5) nudge_msg='brim: context critical (~512k+) — recycle now.'

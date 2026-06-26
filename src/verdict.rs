@@ -107,7 +107,7 @@ pub struct BehaviorSignals {
     /// Count of A→B→A alternations (ping-pong, no-progress qualifier) in the tool sequence.
     /// Threshold candidate: >= 3.
     pub ping_pong_count: Option<u32>,
-    /// True when last turn carried stop_reason=max_tokens (wall hit — Thrash/decisive).
+    /// True if any assistant turn within the last TREND_TAIL_K turns carried stop_reason=max_tokens.
     pub stop_reason_max_tokens: bool,
 }
 
@@ -268,6 +268,8 @@ impl Tier {
 pub struct FamilyVoteInputs<'a> {
     pub window_tokens: u64,
     pub watch_tokens: u64,
+    /// Absolute recycle backstop; decisive override fires when window_tokens >= this.
+    pub recycle_backstop: u64,
     pub projected_turns: Option<u32>,
     pub sustained_cache_thrash: bool,
     /// Behavioral degradation signals; None = provider has no tool-use extraction.
@@ -320,6 +322,7 @@ pub fn behavior_fires(signals: Option<&BehaviorSignals>) -> bool {
 }
 
 /// Drift family: slow session-long rot a short tail misses (ADR-025).
+// deferred to roadmap #2 (long-horizon EWMA across resets); excluded from count until independent
 pub fn drift_fires(drift_score: Option<f32>) -> bool {
     drift_score.is_some_and(|s| s > DRIFT_SCORE_THRESHOLD)
 }
@@ -337,14 +340,18 @@ pub fn family_vote_verdict(inputs: &FamilyVoteInputs) -> VoteResult {
         drift_fires(inputs.drift_score),
     ];
 
-    let count = families.iter().filter(|&&f| f).count() as u8;
+    // Count from 4 core families only; Drift (index 4) is excluded until independent
+    // (roadmap #2: long-horizon EWMA across resets).
+    let count = families[..4].iter().filter(|&&f| f).count() as u8;
 
-    // Decisive override: stop_reason_max_tokens OR confirmed tool repetition loop.
+    // Decisive override: stop_reason_max_tokens OR confirmed tool repetition loop OR
+    // occupancy at/above the absolute backstop (restores Over path for behavior-blind providers).
     let decisive_override = stop_reason_max_tokens
         || inputs.behavior.is_some_and(|b| {
             b.repetition_run
                 .is_some_and(|r| r >= BEHAVIOR_REPETITION_THRESHOLD)
-        });
+        })
+        || inputs.window_tokens >= inputs.recycle_backstop;
 
     let tier = if decisive_override {
         Tier::Critical
@@ -742,6 +749,7 @@ mod tests {
         FamilyVoteInputs {
             window_tokens: 1_000,
             watch_tokens: watch,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
             projected_turns: None,
             sustained_cache_thrash: false,
             behavior: None,
@@ -765,6 +773,7 @@ mod tests {
         let inputs = FamilyVoteInputs {
             window_tokens: 40_000,
             watch_tokens: 32_000,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
             projected_turns: None,
             sustained_cache_thrash: false,
             behavior: None,
@@ -783,6 +792,7 @@ mod tests {
         let inputs = FamilyVoteInputs {
             window_tokens: 40_000,
             watch_tokens: 32_000,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
             projected_turns: Some(1),
             sustained_cache_thrash: false,
             behavior: None,
@@ -797,11 +807,13 @@ mod tests {
 
     #[test]
     fn vote_counter_two_families_with_drift_stale() {
-        // Volume + Drift (2 families, Drift fires) → Stale → Over
+        // Volume + Speed (count=2 from 4-family count) + drift_score → Stale → Over
+        // Drift excluded from count; fires only as tier-split within >=2 band.
         let inputs = FamilyVoteInputs {
             window_tokens: 40_000,
             watch_tokens: 32_000,
-            projected_turns: None,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
+            projected_turns: Some(PROJECTION_NEARING_TURNS),
             sustained_cache_thrash: false,
             behavior: None,
             drift_score: Some(DRIFT_SCORE_THRESHOLD + 0.1),
@@ -824,6 +836,7 @@ mod tests {
         let inputs = FamilyVoteInputs {
             window_tokens: 40_000,
             watch_tokens: 32_000,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
             projected_turns: None,
             sustained_cache_thrash: false,
             behavior: Some(&BEHAVIOR),
@@ -845,8 +858,9 @@ mod tests {
             stop_reason_max_tokens: false,
         };
         let inputs = FamilyVoteInputs {
-            window_tokens: 1_000, // below watch
+            window_tokens: 1_000, // below watch and below backstop
             watch_tokens: 32_000,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
             projected_turns: None,
             sustained_cache_thrash: false,
             behavior: Some(&BEHAVIOR),
@@ -869,8 +883,9 @@ mod tests {
             stop_reason_max_tokens: true,
         };
         let inputs = FamilyVoteInputs {
-            window_tokens: 1_000, // below watch
+            window_tokens: 1_000, // below watch and below backstop
             watch_tokens: 32_000,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
             projected_turns: None,
             sustained_cache_thrash: false,
             behavior: Some(&BEHAVIOR),
@@ -881,5 +896,50 @@ mod tests {
         assert!(r.families[2], "thrash fires for stop_reason_max_tokens");
         assert_eq!(r.tier, Tier::Critical);
         assert_eq!(r.verdict, Verdict::Over);
+    }
+
+    #[test]
+    fn vote_counter_backstop_decisive_override() {
+        // window_tokens >= recycle_backstop, no behavior/trend → decisive_override → Critical → Over
+        let inputs = FamilyVoteInputs {
+            window_tokens: ABSOLUTE_RECYCLE_BACKSTOP,
+            watch_tokens: ABSOLUTE_WATCH_TOKENS,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
+            projected_turns: None,
+            sustained_cache_thrash: false,
+            behavior: None,
+            drift_score: None,
+        };
+        let r = family_vote_verdict(&inputs);
+        assert!(
+            r.decisive_override,
+            "backstop hit must fire decisive_override"
+        );
+        assert_eq!(r.tier, Tier::Critical);
+        assert_eq!(r.verdict, Verdict::Over);
+        assert_eq!(r.verdict_gate, Some(VerdictGate::DecisiveOverride));
+    }
+
+    #[test]
+    fn vote_counter_drift_excluded_from_count() {
+        // Volume fires (count=1) + drift_score positive → count stays 1, NOT Stale
+        // Drift cannot escalate tier alone; it only refines within >=2 band.
+        let inputs = FamilyVoteInputs {
+            window_tokens: 40_000,
+            watch_tokens: 32_000,
+            recycle_backstop: ABSOLUTE_RECYCLE_BACKSTOP,
+            projected_turns: None, // speed doesn't fire
+            sustained_cache_thrash: false,
+            behavior: None,
+            drift_score: Some(DRIFT_SCORE_THRESHOLD + 0.1),
+        };
+        let r = family_vote_verdict(&inputs);
+        assert!(r.families[4], "drift family fires");
+        assert_eq!(
+            r.count, 1,
+            "drift excluded from count; only 4 families count"
+        );
+        assert_eq!(r.tier, Tier::Drift); // count=1 → Drift tier, NOT Stale
+        assert_eq!(r.verdict, Verdict::Nearing);
     }
 }

@@ -152,7 +152,13 @@ fn extract_codex_behavior(tail: &str) -> Option<BehaviorSignals> {
         }
     }
 
-    BehaviorSignals::from_signals(&tool_calls, &error_flags, stop_reason_max_tokens)
+    // Bound to last TREND_TAIL_K entries for a consistent analysis window.
+    let start = tool_calls.len().saturating_sub(TREND_TAIL_K);
+    let tool_calls = &tool_calls[start..];
+    let start = error_flags.len().saturating_sub(TREND_TAIL_K);
+    let error_flags = &error_flags[start..];
+
+    BehaviorSignals::from_signals(tool_calls, error_flags, stop_reason_max_tokens)
 }
 
 fn parse_session_file(path: &Path, backstop: u64) -> Option<SessionNode> {

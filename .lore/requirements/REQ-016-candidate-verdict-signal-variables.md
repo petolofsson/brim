@@ -1,7 +1,7 @@
 ---
 id: REQ-016
 title: Candidate verdict-signal variables
-status: Draft
+status: Accepted
 related_requirements: [FEATURE-001]
 related_adrs:
   - ADR-010

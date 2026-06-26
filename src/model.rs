@@ -104,6 +104,7 @@ pub fn compute_subtree(node: &SessionNode, thresholds: &Thresholds) -> SubtreeIn
         let inputs = FamilyVoteInputs {
             window_tokens: w.window_tokens,
             watch_tokens: thresholds.watch_tokens,
+            recycle_backstop: thresholds.recycle_backstop,
             projected_turns,
             sustained_cache_thrash: thrash,
             behavior: node.behavior.as_ref(),
@@ -266,6 +267,7 @@ fn self_verdict(node: &SessionNode, thresholds: &Thresholds) -> (Verdict, Option
         let inputs = FamilyVoteInputs {
             window_tokens: w.window_tokens,
             watch_tokens: thresholds.watch_tokens,
+            recycle_backstop: thresholds.recycle_backstop,
             projected_turns,
             sustained_cache_thrash: thrash,
             behavior: node.behavior.as_ref(),
@@ -411,7 +413,7 @@ mod tests {
             rec.target_node_id, leaf_id,
             "leaf is deeper and explains Over"
         );
-        assert_eq!(rec.target_verdict, Verdict::Nearing);
+        assert_eq!(rec.target_verdict, Verdict::Over);
         assert!(!rec.is_root);
         assert!(rec.blast_radius.is_empty(), "leaf has no descendants");
     }
@@ -437,7 +439,7 @@ mod tests {
             rec.target_node_id, mid_id,
             "intermediate is Over while leaf is Ok"
         );
-        assert_eq!(rec.target_verdict, Verdict::Nearing);
+        assert_eq!(rec.target_verdict, Verdict::Over);
         assert!(!rec.is_root);
         // blast radius = leaf
         assert_eq!(rec.blast_radius.len(), 1);
@@ -460,7 +462,7 @@ mod tests {
 
         assert_eq!(rec.target_node_id, root_uuid);
         assert!(rec.is_root, "root-case must be flagged");
-        assert_eq!(rec.target_verdict, Verdict::Nearing);
+        assert_eq!(rec.target_verdict, Verdict::Over);
         // blast radius includes child
         assert_eq!(rec.blast_radius.len(), 1);
         assert_eq!(rec.blast_radius[0].node_id, child_id);
@@ -558,7 +560,7 @@ mod tests {
             rec.target_node_id, child_id,
             "child is deeper and shares Over verdict — depth wins"
         );
-        assert_eq!(rec.target_verdict, Verdict::Nearing);
+        assert_eq!(rec.target_verdict, Verdict::Over);
         assert!(!rec.is_root);
         assert!(rec.blast_radius.is_empty(), "child has no descendants");
     }

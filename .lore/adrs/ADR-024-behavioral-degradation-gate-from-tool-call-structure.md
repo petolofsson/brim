@@ -1,7 +1,7 @@
 ---
 id: ADR-024
 title: Behavioral degradation gate from tool-call structure
-status: Draft
+status: Accepted
 related_requirements:
   - REQ-004
   - REQ-016
