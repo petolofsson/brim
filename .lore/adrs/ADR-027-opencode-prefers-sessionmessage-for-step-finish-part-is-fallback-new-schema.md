@@ -24,14 +24,28 @@ ADR-005 fixed opencode's point-in-time oracle to the latest `part` row with
 `json_extract(data,'$.type')='step-finish'`, ordered `time_created DESC`. That
 was correct for opencode v1.17.5.
 
-New opencode **relocated step-finish rows out of `part` into a new
-`session_message` table** with native `type` and `seq` columns
-(`UNIQUE(session_id,seq)`, index `(session_id,type,seq)`). Under the new schema
-the `part` table no longer carries step-finish rows. The old part-only oracle
-therefore found nothing and **silently fell back to the `session` aggregate
-columns** — cumulative spend, which ADR-002 establishes is NOT window occupancy.
-Reported occupancy was wrong (cumulative ≠ point-in-time) with no signal to the
-consumer beyond the `window_source = aggregate` tag.
+This decision is **DEFENSIVE forward-compat**, not a fix for an observed
+current-version bug. The opencode 1.17.9 schema adds a `session_message` table
+with native `type` and `seq` columns (`UNIQUE(session_id,seq)`, index
+`(session_id,type,seq)`), so a future opencode *could* relocate step-finish rows
+there. brim prefers that table **if step-finish is present in it**, and falls
+back to `part` otherwise.
+
+**VERIFIED against opencode 1.17.9** (real verification run): step-finish rows
+are **observed in `part`**, NOT in `session_message`. A real `part` step-finish
+row was read and its token JSON shape
+(`data.tokens.{total, input, output, cache.{read, write}}`) **matches brim's
+`step_finish_oracle` exactly**. The `session_message`-empty → `part` fallback
+fires correctly, so the original part-only parser would have worked on 1.17.9 —
+**the "silent aggregate fallback" was NOT reproduced on any observed version.**
+
+The dossier's earlier "relocated step-finish out of `part` into
+`session_message`" claim is **UNCONFIRMED**: no opencode version has been
+observed actually moving step-finish there. The `session_message` preference is
+therefore speculative/forward-looking — harmless if the move never happens
+(the `part` fallback covers today's schema), and correct ahead-of-time if it
+does. Aggregate spend (cumulative, which ADR-002 establishes is NOT window
+occupancy) remains the last-resort fallback tagged `window_source = aggregate`.
 
 This matters for **ADR-026 M1**: opencode is behavior-blind (`behavior:None`), so
 the vote-counter leans on accurate occupancy for the `recycle_backstop` decisive
@@ -43,8 +57,9 @@ Verified schema (read-only local DB):
 ```
 session_message: id, session_id, type, seq, time_created, time_updated, data
   UNIQUE(session_id,seq); INDEX(session_id,type,seq), (session_id,time_created,id)
-part (new): id, message_id, session_id, time_created, time_updated, data
-  -- no type column; step-finish data NOT here under the new schema
+  -- table EXISTS in 1.17.9 but currently carries NO step-finish rows
+part: id, message_id, session_id, time_created, time_updated, data
+  -- step-finish OBSERVED here on 1.17.9 via json_extract(data,'$.type')
 ```
 
 ## Decision
@@ -68,36 +83,40 @@ and its ordering column (`seq` vs `time_created`) change.
 
 ## Consequences
 
-* Sessions on the new opencode schema again report point-in-time occupancy
-  instead of silently degrading to the aggregate, restoring the occupancy
-  accuracy ADR-026 M1's backstop relies on for behavior-blind opencode.
-* Older opencode DBs keep working via the `part` fallback — no flag-day cutover.
+* If a future opencode relocates step-finish to `session_message`, brim already
+  reports point-in-time occupancy from it instead of silently degrading to the
+  aggregate — preserving the occupancy accuracy ADR-026 M1's backstop relies on
+  for behavior-blind opencode, with no flag-day cutover.
+* Today's opencode (1.17.9, step-finish in `part`) and older DBs keep working via
+  the `part` fallback — the observed-correct current path.
 * Two extra prepared queries per session in the worst case (session_message miss
   → part). Bounded by `TREND_TAIL_K`; no full scan.
 
-## Open Risk — UNVERIFIED step-finish `data` JSON shape (verification PENDING)
+## Verified — step-finish `data` JSON shape (opencode 1.17.9)
 
-The fix **assumes** new opencode kept the step-finish `data` JSON shape
-identical — `data.tokens.{total, input, output, cache.{read, write}}` — and only
-relocated the row from `part` to `session_message`. This is **UNVERIFIED**: the
-local opencode DB is **empty (0 rows)**, so the assumed shape could not be checked
-against populated new-schema data.
+**VERIFIED against opencode 1.17.9.** A real step-finish row was read from the
+`part` table and its token JSON shape —
+`data.tokens.{total, input, output, cache.{read, write}}` — **matches brim's
+`step_finish_oracle` exactly**. The `window_tokens` mapping
+(`input + cache.read + cache.write`) reads correctly off it.
 
-If the shape actually changed (renamed/nested token fields, different units), the
-`session_message` parse yields zero/garbage tokens and the oracle **silently
-reverts to the aggregate-fallback bug** — the exact failure this ADR fixes — which
-again weakens ADR-026 M1's backstop reliance for behavior-blind opencode.
-
-**Verification against a populated new-schema opencode DB is PENDING.** Until a
-real DB with step-finish `session_message` rows confirms the token shape, treat
-the new-schema point-in-time path as assumed-correct-but-unconfirmed. If
-verification fails, supersede this ADR with the corrected field mapping.
+step-finish is currently observed in `part`, NOT `session_message`, so the
+`session_message`-empty → `part` fallback supplies the point-in-time window on
+1.17.9. The forward-looking risk is only theoretical: *if* a future opencode both
+relocates step-finish to `session_message` AND changes the token shape there
+(renamed/nested fields, different units), the `session_message` parse could yield
+zero/garbage tokens and the oracle would revert to the aggregate fallback. That
+combination is unobserved on any version. If a future schema move lands, re-verify
+the `session_message` token shape and supersede this ADR if the mapping differs.
 
 ## Alternatives Considered
 
-- **Keep part-only (ADR-005) and accept aggregate fallback on new schema.**
-  Rejected — that IS the bug: cumulative ≠ window (ADR-002), and it silently
-  degrades opencode's behavior-blind backstop.
+- **Keep part-only (ADR-005), add nothing.** Defensible today — part-only is
+  observed-correct on 1.17.9. Rejected only as forward-compat: if a future
+  opencode moves step-finish to `session_message`, part-only would silently fall
+  back to the aggregate (cumulative ≠ window, ADR-002), degrading opencode's
+  behavior-blind backstop. The `session_message` preference forecloses that
+  failure cheaply.
 - **Query only `session_message` (drop `part`).** Rejected — breaks older
   opencode DBs that still carry step-finish in `part`; the fallback is cheap and
   schema-version-agnostic.

@@ -26,13 +26,15 @@ related_tests:
   database file is absent; availability is a cheap path check on the file only.
 * The system shall compute the point-in-time last-turn window from the latest
   step-finish row, with this source precedence (ADR-027):
-  1. **Preferred** — the latest `session_message` row for the session where the
-     native `type` column = `'step-finish'`, ordered by `seq DESC LIMIT 1`
-     (new opencode schema).
-  2. **Fallback** — when `session_message` is absent or has no step-finish row
-     for the session, the latest `part` row where
+  1. **Preferred-if-present** — the latest `session_message` row for the session
+     where the native `type` column = `'step-finish'`, ordered by
+     `seq DESC LIMIT 1`. Forward-compat for a possible future opencode schema
+     move; on observed opencode (1.17.9) this table carries no step-finish rows.
+  2. **Current observed source** — the latest `part` row where
      `json_extract(data,'$.type')='step-finish'`, ordered by
-     `time_created DESC LIMIT 1` (old opencode schema). A missing table is
+     `time_created DESC LIMIT 1`. This is THE step-finish source on opencode
+     1.17.9 (verified) and on older DBs; it is used whenever `session_message`
+     is absent or has no step-finish row for the session. A missing table is
      detected by `prepare()` failure and treated as "not available".
   Both queries are SQL-side bound (no full scan in Rust). From the chosen row's
   `data.tokens`:
@@ -64,10 +66,11 @@ related_tests:
 ## Rationale
 
 opencode stores transcripts in SQLite (not JSONL), and step-finish rows carry the
-same point-in-time usage signal claude's last `assistant` turn does. New opencode
-relocated those rows from the `part` table to a `session_message` table with
-native `type`+`seq` columns, so brim prefers `session_message` and falls back to
-the old `part` query for older DBs (ADR-027). The `session` table additionally
+same point-in-time usage signal claude's last `assistant` turn does. On observed
+opencode (1.17.9, verified) step-finish lives in the `part` table — that is the
+current source. The `session_message` table exists in the 1.17.9 schema but
+carries no step-finish rows; brim prefers it *if present* purely as forward-compat
+for a possible future schema move, and otherwise uses the `part` query (ADR-027). The `session` table additionally
 holds cumulative token aggregates, which are NOT window occupancy (ADR-002). When
 a step-finish row exists it wins; when none does (pre-checkpoint sessions) the
 aggregate is the documented "approximate or unavailable" case ADR-002 permits,

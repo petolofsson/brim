@@ -63,7 +63,7 @@ Verified availability of tool-call STRUCTURE (name, args, error flag, ordering):
 |---|---|---|---|---|
 | **Claude** | Yes (live data) | `is_error` boolean | object | Fully implemented |
 | **codex** | Yes (spec-derived, no local data) | `function_call_output.status='failed'` | JSON **string** (parse before hash) | `~/.codex` absent on machine |
-| **opencode** | Yes (schema-confirmed, 0 live rows) | `state.status='error'` | JSON **object** | New `session_message` table vs old `part`; DB empty |
+| **opencode** | Yes (verified, 1.17.9) | `state.status='error'` | JSON **object** | step-finish in `part`; `session_message` present but unused; token shape verified |
 | **copilot** | **No** — process-log source carries no tool structure | — | — | Behavior family can never fire |
 
 Key gotchas baked into the design: **no provider uses a uniform boolean `is_error`** (status
@@ -71,8 +71,13 @@ discriminators); **codex args are a string, opencode/Claude args are objects** (
 parse before hashing). Runtime error detection stays **structural** per provider — the
 no-content-inspection invariant holds at runtime.
 
-**Separately flagged bug (not yet fixed):** brim's `opencode.rs` reads the *old* `part` table;
-new opencode writes to `session_message` → brim may silently fall back to aggregate occupancy.
+**Forward-compat note (not a current bug):** on opencode 1.17.9 (verified) step-finish is still
+written to the `part` table; the `session_message` table exists in the schema but carries no
+step-finish rows. A real `part` step-finish row was read and its token JSON shape matches brim's
+oracle exactly. brim's `opencode.rs` prefers `session_message` *if present* and falls back to
+`part` — defensive forward-compat for a possible future schema move, NOT a reproduced bug. No
+observed opencode version actually relocates step-finish, so the aggregate fallback does not fire
+on current versions.
 
 ---
 
