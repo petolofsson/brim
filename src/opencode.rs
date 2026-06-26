@@ -17,13 +17,17 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::home_dir,
     provider::Provider,
+    verdict::BehaviorSignals,
     window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    path::PathBuf,
+};
 
 /// Max sessions enumerated (CODERULES r3).
 const MAX_SESSIONS: usize = 256;
@@ -190,6 +194,7 @@ pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
     for row in raw {
         let model = parse_model_id(row.model_json.as_deref());
         let pkey = project_key(conn, row.project_id.as_deref(), row.directory.as_deref());
+        let behavior = extract_opencode_behavior(conn, &row.id);
         let (window, last_turn_at, trend) = step_finish_oracle(conn, &row.id, &model, backstop)
             .unwrap_or_else(|| {
                 (
@@ -208,7 +213,7 @@ pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
                 children: Vec::new(),
                 last_turn_at,
                 trend,
-                behavior: None, // opencode SQLite source does not carry tool_use parts in the queried part types; Behavior family cannot currently fire for this provider.
+                behavior,
             },
         ));
     }
@@ -254,6 +259,65 @@ pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
         roots.push(node);
     }
     roots
+}
+
+/// Extract BehaviorSignals from opencode tool-call parts.
+///
+/// Tool rows live in `part` with `data.type='tool'` (LIVE-VERIFIED, opencode 1.17.9).
+/// Name: `data.tool`; args object: `data.state.input`; error: `data.state.status='error'`.
+/// Fail-closed: missing/malformed rows yield None rather than panic or error.
+fn extract_opencode_behavior(conn: &Connection, session_id: &str) -> Option<BehaviorSignals> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT data FROM part
+             WHERE session_id = ?1
+               AND json_extract(data, '$.type') = 'tool'
+             ORDER BY time_created DESC, id DESC LIMIT ?2",
+        )
+        .ok()?;
+    // DESC to grab the most-recent K rows; reverse back to chronological before analysis.
+    let mut rows: Vec<String> = stmt
+        .query_map(params![session_id, TREND_TAIL_K as i64], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    rows.reverse();
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut tool_calls: Vec<(String, u64)> = Vec::new();
+    let mut error_flags: Vec<bool> = Vec::new();
+
+    for data in &rows {
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let Some(name) = v.get("tool").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        // Hash the args object (data.state.input) for repetition detection.
+        let args_str = v
+            .get("state")
+            .and_then(|s| s.get("input"))
+            .map(|x| x.to_string())
+            .unwrap_or_default();
+        let mut hasher = DefaultHasher::new();
+        args_str.hash(&mut hasher);
+        tool_calls.push((name.to_string(), hasher.finish()));
+
+        let is_error = v
+            .get("state")
+            .and_then(|s| s.get("status"))
+            .and_then(|x| x.as_str())
+            == Some("error");
+        error_flags.push(is_error);
+    }
+
+    BehaviorSignals::from_signals(&tool_calls, &error_flags, false)
 }
 
 /// Query the last TREND_TAIL_K step-finish parts for a session and build the
@@ -920,6 +984,225 @@ mod tests {
             "session_message must win over part"
         );
         assert_eq!(w.window_source, WindowSource::LastTurn);
+    }
+
+    // Behavior fires on repeated identical tool calls (repetition_run >= 2).
+    // LIVE-VERIFIED shape: part.data.type='tool', .tool=name, .state.input=args, .state.status=error.
+    #[test]
+    fn test_opencode_behavior_fires_on_repetition() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_behav_rep', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // Three identical Bash("ls") tool calls → repetition_run == 3 → fires.
+        for (i, t) in [1000u64, 2000, 3000].iter().enumerate() {
+            let data = serde_json::json!({
+                "type": "tool",
+                "tool": "Bash",
+                "callID": format!("call_{i}"),
+                "state": { "status": "completed", "input": {"command": "ls"} }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data)
+                 VALUES (?1, 'ses_behav_rep', ?2, ?3)",
+                params![format!("pt_rep_{i}"), *t as i64, data],
+            )
+            .unwrap();
+        }
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let node = nodes.iter().find(|n| n.session_uuid == "ses_behav_rep").unwrap();
+        let b = node.behavior.as_ref().expect("behavior must be Some");
+        assert_eq!(b.repetition_run, Some(3), "3 identical calls → repetition_run==3");
+    }
+
+    // Behavior fires on error streak (failure_streak >= 1).
+    #[test]
+    fn test_opencode_behavior_fires_on_error_streak() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_behav_err', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // Two sequential failed tool calls → failure_streak == 2 → fires.
+        for (i, t) in [1000u64, 2000].iter().enumerate() {
+            let data = serde_json::json!({
+                "type": "tool",
+                "tool": format!("Tool{i}"),
+                "callID": format!("call_e{i}"),
+                "state": { "status": "error", "input": {"x": i} }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data)
+                 VALUES (?1, 'ses_behav_err', ?2, ?3)",
+                params![format!("pt_err_{i}"), *t as i64, data],
+            )
+            .unwrap();
+        }
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let node = nodes.iter().find(|n| n.session_uuid == "ses_behav_err").unwrap();
+        let b = node.behavior.as_ref().expect("behavior must be Some");
+        assert_eq!(b.failure_streak, Some(2), "2 consecutive errors → failure_streak==2");
+    }
+
+    // Behavior does NOT fire on a healthy varied-tool session (>K=8 rows exercises tail window).
+    #[test]
+    fn test_opencode_behavior_no_fire_healthy() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_behav_ok', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // 9 distinct successful tool calls (> K=8) — no repetition, no errors, no ping-pong.
+        let calls = [
+            ("Read",  r#"{"path":"/a"}"#),
+            ("Bash",  r#"{"command":"cargo build"}"#),
+            ("Write", r#"{"path":"/b","content":"x"}"#),
+            ("Grep",  r#"{"pattern":"fn main"}"#),
+            ("Edit",  r#"{"path":"/c"}"#),
+            ("Bash",  r#"{"command":"cargo test"}"#),
+            ("Read",  r#"{"path":"/d"}"#),
+            ("Write", r#"{"path":"/e","content":"y"}"#),
+            ("Grep",  r#"{"pattern":"struct "}"#),
+        ];
+        for (i, (tool, input)) in calls.iter().enumerate() {
+            let data = serde_json::json!({
+                "type": "tool",
+                "tool": tool,
+                "callID": format!("call_ok{i}"),
+                "state": { "status": "completed", "input": serde_json::from_str::<Value>(input).unwrap() }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data)
+                 VALUES (?1, 'ses_behav_ok', ?2, ?3)",
+                params![format!("pt_ok_{i:02}"), (i as i64 + 1) * 1000, data],
+            )
+            .unwrap();
+        }
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let node = nodes.iter().find(|n| n.session_uuid == "ses_behav_ok").unwrap();
+        // BehaviorSignals may be Some but no signal should fire.
+        if let Some(b) = &node.behavior {
+            assert!(b.repetition_run.is_none(), "varied tools → no repetition_run");
+            assert!(b.failure_streak.is_none(), "no errors → no failure_streak");
+            assert!(b.ping_pong_count.is_none(), "no ping-pong");
+        }
+    }
+
+    // Ping-pong FIRES when the tail (last K rows) contains A,B,A,B,… with matching args.
+    // Uses 12 rows: 4-row head (distinct, no pattern) + 8-row tail (A,B alternating, same args).
+    // Catches B1-style regression: ASC query would include head rows and miss the threshold.
+    #[test]
+    fn test_opencode_behavior_ping_pong_fires() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_pp_fire', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // Head: 4 distinct tools at times 1000-4000 (not in tail window).
+        let head = ["ToolX0", "ToolX1", "ToolX2", "ToolX3"];
+        for (i, tool) in head.iter().enumerate() {
+            let data = serde_json::json!({
+                "type": "tool", "tool": tool, "callID": format!("c_h{i}"),
+                "state": { "status": "completed", "input": {"x": i} }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data) VALUES (?1,'ses_pp_fire',?2,?3)",
+                params![format!("pt_pf_h{i:02}"), (i as i64 + 1) * 1000, data],
+            )
+            .unwrap();
+        }
+        // Tail: 8 rows A,B,A,B,A,B,A,B with identical args → ping_pong_count = 6 >= 3.
+        let tail_tools = ["ToolA", "ToolB", "ToolA", "ToolB", "ToolA", "ToolB", "ToolA", "ToolB"];
+        let tail_args = [r#"{"cmd":"read"}"#, r#"{"cmd":"write"}"#];
+        for (i, tool) in tail_tools.iter().enumerate() {
+            let args: Value = serde_json::from_str(tail_args[i % 2]).unwrap();
+            let data = serde_json::json!({
+                "type": "tool", "tool": tool, "callID": format!("c_t{i}"),
+                "state": { "status": "completed", "input": args }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data) VALUES (?1,'ses_pp_fire',?2,?3)",
+                params![format!("pt_pf_t{i:02}"), (i as i64 + 5) * 1000, data],
+            )
+            .unwrap();
+        }
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let node = nodes.iter().find(|n| n.session_uuid == "ses_pp_fire").unwrap();
+        let b = node.behavior.as_ref().expect("behavior must be Some");
+        assert!(
+            b.ping_pong_count.unwrap_or(0) >= 3,
+            "tail A,B,A,B,… with same args → ping_pong_count >= 3; got {:?}",
+            b.ping_pong_count
+        );
+    }
+
+    // Ping-pong does NOT fire when alternating A,B,A,B args differ position-to-position.
+    // Uses 12 rows: 4 head (distinct) + 8 tail with mismatched args.
+    #[test]
+    fn test_opencode_behavior_ping_pong_no_fire_different_args() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_pp_nofire', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // Head: 4 distinct tools at times 1000-4000.
+        for i in 0..4usize {
+            let data = serde_json::json!({
+                "type": "tool", "tool": format!("HeadTool{i}"), "callID": format!("c_hn{i}"),
+                "state": { "status": "completed", "input": {"n": i} }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data) VALUES (?1,'ses_pp_nofire',?2,?3)",
+                params![format!("pt_pn_h{i:02}"), (i as i64 + 1) * 1000, data],
+            )
+            .unwrap();
+        }
+        // Tail: A(args1),B(args1),A(args2),B(args2),A(args1),B(args1),A(args2),B(args2)
+        // Every A→?→A window has mismatched args → ping_pong_count = 0.
+        let tail_tools = ["ToolA", "ToolB", "ToolA", "ToolB", "ToolA", "ToolB", "ToolA", "ToolB"];
+        let tail_args = [
+            r#"{"v":1}"#, r#"{"v":1}"#, r#"{"v":2}"#, r#"{"v":2}"#,
+            r#"{"v":1}"#, r#"{"v":1}"#, r#"{"v":2}"#, r#"{"v":2}"#,
+        ];
+        for (i, tool) in tail_tools.iter().enumerate() {
+            let args: Value = serde_json::from_str(tail_args[i]).unwrap();
+            let data = serde_json::json!({
+                "type": "tool", "tool": tool, "callID": format!("c_tn{i}"),
+                "state": { "status": "completed", "input": args }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data) VALUES (?1,'ses_pp_nofire',?2,?3)",
+                params![format!("pt_pn_t{i:02}"), (i as i64 + 5) * 1000, data],
+            )
+            .unwrap();
+        }
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let node = nodes.iter().find(|n| n.session_uuid == "ses_pp_nofire").unwrap();
+        if let Some(b) = &node.behavior {
+            assert!(
+                b.ping_pong_count.is_none(),
+                "differing args → no ping-pong; got {:?}",
+                b.ping_pong_count
+            );
+        }
     }
 
     // Falls back to part table when session_message is absent (old opencode schema).

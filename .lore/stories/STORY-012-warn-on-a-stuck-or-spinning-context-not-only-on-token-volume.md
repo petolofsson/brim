@@ -1,15 +1,18 @@
 ---
 id: STORY-012
 title: Warn on a stuck or spinning context, not only on token volume
-status: Draft
+status: Accepted
 related_requirements:
   - FEATURE-001
   - REQ-016
 related_adrs:
   - ADR-010
   - ADR-024
+  - ADR-025
+  - ADR-028
 related_stories: []
-related_tests: []
+related_tests:
+  - TEST-010
 ---
 
 # STORY-012 - Warn on a stuck or spinning context, not only on token volume

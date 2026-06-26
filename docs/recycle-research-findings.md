@@ -68,7 +68,7 @@ yet stub `behavior:None`, in which case its Behavior family can never fire regar
 |---|---|---|---|---|---|
 | **Claude** | Yes (live data) | **Yes** (`claude.rs`) | `is_error` boolean | object | Fully implemented |
 | **codex** | Yes (spec-derived, no local data) | **Yes** (`codex.rs:98`) | `function_call_output.status='failed'` | JSON **string** (parse before hash) | `~/.codex` absent on machine |
-| **opencode** | Yes (verified, 1.17.9) | **No — stub** (`opencode.rs:211` `behavior:None`) | `state.status='error'` | JSON **object** | format present but NOT consumed; Behavior family can never fire until wired; step-finish in `part`; token shape verified |
+| **opencode** | Yes (verified, 1.17.9) | **Yes — WIRED** (live-verified 1.17.9, `opencode.rs::extract_opencode_behavior`; ADR-028) | `state.status='error'` | JSON **object** | tool rows in `part` (`data.type='tool'`); name `data.tool`, args `data.state.input`, last K=8 tail; stub removed, Behavior fires |
 | **copilot** | **No** — process-log source carries no tool structure | **No** (`copilot.rs:113` `behavior:None`) | — | — | neither format nor wiring; Behavior family can never fire |
 
 Key gotchas baked into the design: **no provider uses a uniform boolean `is_error`** (status
