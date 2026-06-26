@@ -94,7 +94,10 @@ fn collect_sessions(sessions_dir: &Path, backstop: u64) -> Vec<SessionNode> {
 }
 
 /// Extract BehaviorSignals from a Codex session JSONL tail.
-/// schema-confirmed; not live-data validated
+/// Live-validated against real Codex sessions (2026-06-26).
+/// Real schema: function_call/function_call_output/custom_tool_call are direct payload
+/// items (payload.type == "function_call"), NOT embedded in a content[] array.
+/// custom_tool_call carries "input" instead of "arguments".
 fn extract_codex_behavior(tail: &str) -> Option<BehaviorSignals> {
     let mut tool_calls: Vec<(String, u64)> = Vec::new();
     let mut error_flags: Vec<bool> = Vec::new();
@@ -119,7 +122,46 @@ fn extract_codex_behavior(tail: &str) -> Option<BehaviorSignals> {
             stop_reason_max_tokens = true;
         }
 
-        // Extract function_call blocks from content[] or payload.content[]
+        // Real Codex schema: {"type":"response_item","payload":{"type":"function_call","name":"...","arguments":"..."}}
+        // arguments is a JSON string; hash the raw string for repetition detection.
+        if let Some(payload) = v.get("payload") {
+            match payload.get("type").and_then(|x| x.as_str()) {
+                Some("function_call") => {
+                    if let Some(name) = payload.get("name").and_then(|x| x.as_str()) {
+                        let args_raw = payload
+                            .get("arguments")
+                            .map(|x| x.to_string())
+                            .unwrap_or_default();
+                        let mut hasher = DefaultHasher::new();
+                        args_raw.hash(&mut hasher);
+                        tool_calls.push((name.to_string(), hasher.finish()));
+                    }
+                    continue;
+                }
+                Some("function_call_output") => {
+                    let is_error =
+                        payload.get("status").and_then(|x| x.as_str()) == Some("failed");
+                    error_flags.push(is_error);
+                    continue;
+                }
+                Some("custom_tool_call") => {
+                    // apply_patch and similar built-in tools; "input" field instead of "arguments"
+                    if let Some(name) = payload.get("name").and_then(|x| x.as_str()) {
+                        let args_raw = payload
+                            .get("input")
+                            .map(|x| x.to_string())
+                            .unwrap_or_default();
+                        let mut hasher = DefaultHasher::new();
+                        args_raw.hash(&mut hasher);
+                        tool_calls.push((name.to_string(), hasher.finish()));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Fallback: function_call blocks in content[] (spec-derived path, not seen in real data).
         let content = v.get("content").and_then(|c| c.as_array()).or_else(|| {
             v.get("payload")
                 .and_then(|p| p.get("content"))
@@ -250,6 +292,7 @@ fn extract_model(tail: &str) -> String {
 }
 
 /// Try `cwd`, `project_path`, `directory` in early lines for a directory basename.
+/// Real Codex sessions carry these inside payload (e.g. session_meta); top-level is legacy fallback.
 fn extract_project_key(tail: &str) -> String {
     for line in tail.lines().take(20) {
         let line = line.trim();
@@ -260,7 +303,12 @@ fn extract_project_key(tail: &str) -> String {
             continue;
         };
         for field in &["cwd", "project_path", "directory"] {
-            if let Some(dir) = v.get(field).and_then(|x| x.as_str())
+            let dir = v
+                .get("payload")
+                .and_then(|p| p.get(*field))
+                .and_then(|x| x.as_str())
+                .or_else(|| v.get(*field).and_then(|x| x.as_str()));
+            if let Some(dir) = dir
                 && let Some(base) = Path::new(dir).file_name().and_then(|n| n.to_str())
             {
                 return base.to_string();
@@ -681,9 +729,150 @@ mod tests {
         assert_eq!(w.window_source, WindowSource::LastTurn);
     }
 
+    // Helpers mirroring real Codex JSONL row shapes (live-validated 2026-06-26).
+    fn make_real_function_call_line(name: &str, args: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-06-26T14:24:43.077Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "id": "fc_test",
+                "name": name,
+                "arguments": args,
+                "call_id": "call_test"
+            }
+        })
+        .to_string()
+    }
+
+    fn make_real_function_call_output_line(status: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-06-26T14:24:43.126Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_test",
+                "output": "some output",
+                "status": status
+            }
+        })
+        .to_string()
+    }
+
+    // Live-backed: real function_call row (response_item → payload.type=function_call) is detected.
+    #[test]
+    fn test_codex_behavior_real_payload_function_call_detected() {
+        let fc = make_real_function_call_line("exec_command", "{\"cmd\":\"rg --files\"}");
+        let fco = make_real_function_call_output_line("completed");
+        let tail = format!("{fc}\n{fco}\n");
+        let b = extract_codex_behavior(&tail).expect("behavior present for real schema");
+        // 1 function_call detected; repetition_run requires >=2 identical, so None here.
+        assert!(
+            b.repetition_run.is_none(),
+            "single call → no repetition (threshold >=2)"
+        );
+        // completed status → failure_streak is None
+        assert!(b.failure_streak.is_none(), "completed output → no failure");
+    }
+
+    // SYNTHETIC: function_call_output with status=='failed' → failure_streak (CODERULES r10).
+    // UNVALIDATED-with-real-data: operator-provided real-failure transcript still pending.
+    #[test]
+    fn test_codex_behavior_failed_output_failure_streak() {
+        // 3 consecutive failed outputs → failure_streak == Some(3).
+        let fc = make_real_function_call_line("exec_command", "{\"cmd\":\"ls\"}");
+        let fail = make_real_function_call_output_line("failed");
+        let ok = make_real_function_call_output_line("completed");
+
+        let failed_tail = format!("{fc}\n{fail}\n{fail}\n{fail}\n");
+        let b = extract_codex_behavior(&failed_tail).expect("behavior present");
+        assert_eq!(
+            b.failure_streak,
+            Some(3),
+            "3 failed outputs → failure_streak==3"
+        );
+
+        // Control: 3 completed outputs → no streak.
+        let ok_tail = format!("{fc}\n{ok}\n{ok}\n{ok}\n");
+        let b2 = extract_codex_behavior(&ok_tail).expect("behavior present");
+        assert!(
+            b2.failure_streak.is_none(),
+            "completed outputs must not produce failure_streak"
+        );
+    }
+
+    // Live-backed: 6 identical exec_command calls mirror the real session's 6 function_calls.
+    #[test]
+    fn test_codex_behavior_real_payload_repetition_6x() {
+        let fc = make_real_function_call_line("exec_command", "{\"cmd\":\"rg --files\"}");
+        let tail = [fc.as_str(); 6].join("\n");
+        let b = extract_codex_behavior(&tail).expect("behavior present");
+        assert_eq!(
+            b.repetition_run,
+            Some(6),
+            "6 identical real-schema function_calls → repetition_run==6"
+        );
+    }
+
+    // Live-backed: custom_tool_call (apply_patch) is counted as a tool call.
+    #[test]
+    fn test_codex_behavior_custom_tool_call_counted() {
+        let ctc = serde_json::json!({
+            "timestamp": "2026-06-26T14:26:06.557Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "id": "ctc_test",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch\n",
+                "call_id": "call_test"
+            }
+        })
+        .to_string();
+        // Two identical apply_patch calls → repetition detected.
+        let tail = format!("{ctc}\n{ctc}\n");
+        let b = extract_codex_behavior(&tail).expect("behavior present");
+        assert_eq!(
+            b.repetition_run,
+            Some(2),
+            "2 identical custom_tool_calls → repetition_run==2"
+        );
+    }
+
+    // Confirmed: token_count event_msg shape matches make_token_count_line helper.
+    // Real row: {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{...}}}}
+    // Code filters on payload.type, not top-level type — so event_msg vs response_item is irrelevant.
+    #[test]
+    fn test_codex_token_count_real_event_msg_shape() {
+        // Mirror real session row 13: input=11975, cached=9088.
+        let line = serde_json::json!({
+            "timestamp": "2026-06-26T14:24:43.126Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 11975u64,
+                        "cached_input_tokens": 9088u64,
+                        "output_tokens": 130u64,
+                        "reasoning_output_tokens": 42u64,
+                        "total_tokens": 12105u64
+                    },
+                    "model_context_window": 258400u64
+                }
+            }
+        })
+        .to_string();
+        let (window, _, _) = extract_window(&line, "gpt-5.5", ABSOLUTE_RECYCLE_BACKSTOP);
+        let w = window.expect("token_count parsed from real event_msg shape");
+        // single event → Aggregate; window_tokens = input_tokens = 11975
+        assert_eq!(w.window_tokens, 11_975);
+        assert_eq!(w.window_source, WindowSource::Aggregate);
+    }
+
     #[test]
     fn test_codex_behavior_repetition_extraction() {
-        // schema-confirmed; not live-data validated
+        // legacy content[] schema (spec-derived fallback path)
         let line1 = serde_json::json!({
             "content": [
                 {"type": "function_call", "name": "Bash", "arguments": "{\"command\":\"ls\"}"}
@@ -709,6 +898,24 @@ mod tests {
             Some(3),
             "3 identical function_calls → repetition_run==3"
         );
+    }
+
+    // Live-backed: real session_meta shape (payload.cwd) → non-empty project_key.
+    // Real session row 0: {"type":"session_meta","payload":{"cwd":"/home/pol/code/temp",...}}
+    #[test]
+    fn test_codex_project_key_from_payload_cwd() {
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-06-26T14:24:34.018Z",
+            "type": "session_meta",
+            "payload": {
+                "session_id": "019f0450-5c45-7ac2-b923-780a1d96c1c3",
+                "cwd": "/home/pol/code/myproject",
+                "model_provider": "openai"
+            }
+        })
+        .to_string();
+        let key = extract_project_key(&session_meta);
+        assert_eq!(key, "myproject", "payload.cwd must yield non-empty project_key");
     }
 
     // window_tokens formula: input_tokens (includes cached) = pure_input + cached.

@@ -67,7 +67,7 @@ yet stub `behavior:None`, in which case its Behavior family can never fire regar
 | Provider | Tool structure (format) | Wired in brim? | Error discriminator | Args | Notes |
 |---|---|---|---|---|---|
 | **Claude** | Yes (live data) | **Yes** (`claude.rs`) | `is_error` boolean | object | Fully implemented |
-| **codex** | Yes (spec-derived, no local data) | **Yes** (`codex.rs:98`) | `function_call_output.status='failed'` | JSON **string** (parse before hash) | `~/.codex` absent on machine |
+| **codex** | Yes (live-verified, codex 0.142.2) | **Yes — WIRED** (live-verified codex 0.142.2, `codex.rs::extract_codex_behavior`; ADR-030) | `function_call_output.status='failed'` (synthetic-validated; real-failure data pending) | JSON **string** (hashed raw) | tool calls are DIRECT payload items (`payload.type` ∈ {function_call, function_call_output, custom_tool_call}), NOT content[]; occupancy from `payload.type='token_count'` |
 | **opencode** | Yes (verified, 1.17.9) | **Yes — WIRED** (live-verified 1.17.9, `opencode.rs::extract_opencode_behavior`; ADR-028) | `state.status='error'` | JSON **object** | tool rows in `part` (`data.type='tool'`); name `data.tool`, args `data.state.input`, last K=8 tail; stub removed, Behavior fires |
 | **copilot** | **No** — process-log source carries no tool structure | **No** (`copilot.rs:113` `behavior:None`) | — | — | neither format nor wiring; Behavior family can never fire |
 
