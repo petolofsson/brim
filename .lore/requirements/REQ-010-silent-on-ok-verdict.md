@@ -6,7 +6,7 @@ related_requirements:
   - FEATURE-003
 related_adrs: [ADR-010]
 related_stories: [STORY-011]
-related_tests: []
+related_tests: [TEST-009]
 ---
 
 # REQ-010 - Silent on Ok verdict
