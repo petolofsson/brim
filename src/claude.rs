@@ -842,6 +842,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // REAL-SHAPE: Claude sets is_error=true on tool_result when bash exits non-zero.
+    // Content begins "Exit code N\n..." (LIVE-VERIFIED from ~/.claude transcripts).
+    // No code change needed — is_error already reflects exit-code failure correctly.
+    #[test]
+    fn test_behavior_failure_streak_claude_real_bash_exit_shape() {
+        let tmp = std::env::temp_dir().join("brim_test_streak_bash_exit");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let uuid = "33330000-0000-0000-0000-000000000010";
+        // Real shape from ~/.claude/projects/**/*.jsonl: is_error=true, content="Exit code 1\n..."
+        let lines = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"id\":\"u1\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"u1\",\"is_error\":true,\"content\":\"Exit code 1\\nerror[E0...]: some compile error\"}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"id\":\"u2\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"u2\",\"is_error\":true,\"content\":\"Exit code 101\\nerror: could not compile\"}]}}\n",
+        );
+        std::fs::write(tmp.join(format!("{uuid}.jsonl")), lines).unwrap();
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        let streak = sessions[0].behavior.as_ref().and_then(|b| b.failure_streak);
+        assert_eq!(
+            streak,
+            Some(2),
+            "real bash exit content with is_error=true → failure_streak fires"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_behavior_stop_reason_max_tokens() {
         let tmp = std::env::temp_dir().join("brim_test_stop_reason");

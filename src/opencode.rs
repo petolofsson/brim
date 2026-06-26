@@ -264,8 +264,11 @@ pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
 /// Extract BehaviorSignals from opencode tool-call parts.
 ///
 /// Tool rows live in `part` with `data.type='tool'` (LIVE-VERIFIED, opencode 1.17.9).
-/// Name: `data.tool`; args object: `data.state.input`; error: `data.state.status='error'`.
-/// Fail-closed: missing/malformed rows yield None rather than panic or error.
+/// Name: `data.tool`; args object: `data.state.input`.
+/// Error rule (OR): `data.state.status='error'` (tool-invocation failure) OR
+/// `data.state.metadata.exit` present and != 0 (command non-zero exit; LIVE-VERIFIED: bash
+/// tool rows keep status='completed' but set metadata.exit to the integer exit code on failure).
+/// Fail-closed: missing/malformed metadata => not-error; missing/malformed rows => skipped.
 fn extract_opencode_behavior(conn: &Connection, session_id: &str) -> Option<BehaviorSignals> {
     let mut stmt = conn
         .prepare(
@@ -309,12 +312,18 @@ fn extract_opencode_behavior(conn: &Connection, session_id: &str) -> Option<Beha
         args_str.hash(&mut hasher);
         tool_calls.push((name.to_string(), hasher.finish()));
 
-        let is_error = v
-            .get("state")
+        let state = v.get("state");
+        let status_error = state
             .and_then(|s| s.get("status"))
             .and_then(|x| x.as_str())
             == Some("error");
-        error_flags.push(is_error);
+        let exit_error = state
+            .and_then(|s| s.get("metadata"))
+            .and_then(|m| m.get("exit"))
+            .and_then(|e| e.as_i64())
+            .map(|code| code != 0)
+            .unwrap_or(false);
+        error_flags.push(status_error || exit_error);
     }
 
     BehaviorSignals::from_signals(&tool_calls, &error_flags, false)
@@ -1049,6 +1058,80 @@ mod tests {
         let node = nodes.iter().find(|n| n.session_uuid == "ses_behav_err").unwrap();
         let b = node.behavior.as_ref().expect("behavior must be Some");
         assert_eq!(b.failure_streak, Some(2), "2 consecutive errors → failure_streak==2");
+    }
+
+    // LIVE-VERIFIED: bash tool rows keep state.status='completed' but set state.metadata.exit
+    // to the integer exit code. Non-zero exit → error flag fires.
+    #[test]
+    fn test_opencode_behavior_metadata_exit_nonzero_fires() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_exit_nz', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // Two bash rows with status='completed' but metadata.exit=1 → failure_streak==2.
+        for (i, t) in [1000u64, 2000].iter().enumerate() {
+            let data = serde_json::json!({
+                "type": "tool",
+                "tool": "Bash",
+                "callID": format!("call_exit{i}"),
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "cargo test"},
+                    "metadata": {"exit": 1, "output": "error output", "truncated": false}
+                }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, session_id, time_created, data)
+                 VALUES (?1, 'ses_exit_nz', ?2, ?3)",
+                params![format!("pt_exit_{i}"), *t as i64, data],
+            )
+            .unwrap();
+        }
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let node = nodes.iter().find(|n| n.session_uuid == "ses_exit_nz").unwrap();
+        let b = node.behavior.as_ref().expect("behavior must be Some");
+        assert_eq!(
+            b.failure_streak,
+            Some(2),
+            "status='completed' + metadata.exit=1 → failure fires on exit code"
+        );
+    }
+
+    // Control: metadata.exit=0 must NOT fire an error flag.
+    #[test]
+    fn test_opencode_behavior_metadata_exit_zero_no_fire() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_exit_z', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        let data = serde_json::json!({
+            "type": "tool",
+            "tool": "Bash",
+            "callID": "call_exit0",
+            "state": {
+                "status": "completed",
+                "input": {"command": "cargo test"},
+                "metadata": {"exit": 0, "output": "ok", "truncated": false}
+            }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, time_created, data)
+             VALUES ('pt_exit_z0', 'ses_exit_z', 1000, ?1)",
+            params![data],
+        )
+        .unwrap();
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let node = nodes.iter().find(|n| n.session_uuid == "ses_exit_z").unwrap();
+        let b = node.behavior.as_ref().expect("behavior must be Some for a parsed session");
+        assert!(b.failure_streak.is_none(), "metadata.exit=0 → no error flag");
     }
 
     // Behavior does NOT fire on a healthy varied-tool session (>K=8 rows exercises tail window).

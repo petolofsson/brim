@@ -7,7 +7,7 @@ related_requirements:
   - REQ-016
 related_adrs: []
 related_stories: [STORY-012]
-related_tests: []
+related_tests: [TEST-012]
 ---
 
 # ADR-024 - Behavioral degradation gate from tool-call structure

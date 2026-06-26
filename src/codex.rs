@@ -801,6 +801,34 @@ mod tests {
         );
     }
 
+    // DOCUMENTED LIMITATION: real codex function_call_output rows have NO status field.
+    // Keys seen in real data: call_id, output, type (LIVE-VERIFIED). Exit code appears only in
+    // the free-text output string ("Process exited with code N") — parsing that would tension
+    // CODERULES r11. As a result, error_flags are always false for real codex sessions and
+    // failure_streak cannot fire. The status='failed' path in the parser is harmless spec-legacy.
+    #[test]
+    fn test_codex_behavior_real_shape_no_status_no_error_flag() {
+        // Real function_call_output shape: no status field, exit only in output text.
+        let fc = make_real_function_call_line("exec_command", "{\"cmd\":\"cargo test\"}");
+        let fco_real_shape = serde_json::json!({
+            "timestamp": "2026-06-26T14:24:43.126Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_real",
+                "output": "Process exited with code 1\nsome error output"
+            }
+        })
+        .to_string();
+        // Three real-shape outputs (no status) → failure_streak must remain None.
+        let tail = format!("{fc}\n{fco_real_shape}\n{fco_real_shape}\n{fco_real_shape}\n");
+        let b = extract_codex_behavior(&tail).expect("behavior present for real schema");
+        assert!(
+            b.failure_streak.is_none(),
+            "real-shape function_call_output (no status field) → no error flag → failure_streak cannot fire"
+        );
+    }
+
     // Live-backed: 6 identical exec_command calls mirror the real session's 6 function_calls.
     #[test]
     fn test_codex_behavior_real_payload_repetition_6x() {
