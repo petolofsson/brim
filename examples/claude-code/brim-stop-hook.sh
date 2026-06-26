@@ -24,37 +24,47 @@ if command -v timeout >/dev/null 2>&1; then
 else
     brim_out=$(brim --session="$session_id" --watch-tokens 96000 --json 2>/dev/null)
 fi
-v=$(printf '%s' "$brim_out" | jq -r '.nodes[0].verdict // empty' 2>/dev/null)
-if [ -z "$v" ]; then
+tier=$(printf '%s' "$brim_out" | jq -r '.nodes[0].tier // empty' 2>/dev/null)
+if [ -z "$tier" ]; then
     exit 0  # REQ-015: brim error / no session / parse failure → silent, exit 0
 fi
 
-# --- per-session debounce: only fire on transition INTO over ---
+# REQ-010 + REQ-015: only fire on bloated/stale/critical (ADR-025 tier).
+# Tier strings come from src/verdict.rs Tier::as_json_str — keep in sync.
+case "$tier" in
+    bloated|stale|critical) ;;
+    *)
+        # Reset stored stage so a later re-escalation notifies (MEDIUM fix)
+        _sd="${XDG_STATE_HOME:-$HOME/.local/state}/brim"
+        printf '0\n' > "$_sd/last-$session_id" 2>/dev/null || true
+        exit 0 ;;
+esac
+
+# --- stage from tier (3=bloated, 4=stale, 5=critical) ---
+case "$tier" in
+    bloated)  stage=3 ;;
+    stale)    stage=4 ;;
+    critical) stage=5 ;;
+esac
+
+# --- per-session debounce: fire only on escalation (current stage > last-notified stage) ---
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/brim"
 mkdir -p "$state_dir" 2>/dev/null || true
 state_file="$state_dir/last-$session_id"
-prior=""
+prior_stage=0
 if [ -f "$state_file" ]; then
-    prior=$(cat "$state_file" 2>/dev/null)
+    read -r prior_stage < "$state_file" 2>/dev/null || prior_stage=0
+    # Validate: must be a non-negative integer; anything else resets to 0
+    case "$prior_stage" in
+        ''|*[!0-9]*) prior_stage=0 ;;
+    esac
 fi
-# If state_dir is unwritable, this silently fails; debounce degrades to 'may repeat'
-printf '%s' "$v" > "$state_file" 2>/dev/null || true
-
-# REQ-010 + REQ-015: anything other than a fresh transition into 'over' → silent
-# Literal "over_recycle" comes from src/verdict.rs Verdict::Over as_json_str — keep in sync.
-if [ "$v" != "over_recycle" ] || [ "$prior" = "over_recycle" ]; then
+# If stage is same or lower than last-notified, suppress (already warned at this level or higher)
+if [ "$stage" -le "$prior_stage" ] 2>/dev/null; then
     exit 0
 fi
-
-# --- transition INTO over: compute occupancy and stage for message ---
-tokens=$(printf '%s' "$brim_out" | jq '.nodes[0].window_tokens // 0' 2>/dev/null)
-occupancy=$(printf '%s' "$tokens" | awk '{printf "%d", ($1 * 100 / 128000)}')
-
-# stage 3/4/5 (verdict=over_recycle → floor at 3; occ drives escalation)
-if   [ "$occupancy" -ge 400 ]; then stage=5
-elif [ "$occupancy" -ge 200 ]; then stage=4
-else                                 stage=3
-fi
+# Update stored stage; if unwritable debounce degrades to 'may repeat'
+printf '%s\n' "$stage" > "$state_file" 2>/dev/null || true
 
 case "$stage" in
     5) nudge_msg='brim: context critical (~512k+) — recycle now.'

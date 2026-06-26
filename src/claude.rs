@@ -2,6 +2,7 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
+    verdict::BehaviorSignals,
     window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -49,10 +51,15 @@ struct TurnData {
     cache_create: u64,
     model: String,
     ts: Option<DateTime<Utc>>,
+    tool_calls: Vec<(String, u64)>,
+    /// tool_result error flags from human turns preceding this assistant turn.
+    error_flags: Vec<bool>,
+    stop_reason_max_tokens: bool,
 }
 
 /// Scan the tail of a JSONL transcript, collect the last TREND_TAIL_K assistant turns,
-/// and return the last-turn WindowInfo, its timestamp, and the velocity trend.
+/// and return the last-turn WindowInfo, its timestamp, the velocity trend, and
+/// behavioral degradation signals (ADR-024/ADR-025).
 fn parse_transcript(
     path: &Path,
     backstop: u64,
@@ -60,10 +67,11 @@ fn parse_transcript(
     Option<WindowInfo>,
     Option<DateTime<Utc>>,
     Option<WindowTrend>,
+    Option<BehaviorSignals>,
 ) {
     let text = match read_tail(path) {
         Ok(t) => t,
-        Err(_) => return (None, None, None),
+        Err(_) => return (None, None, None, None),
     };
 
     // Collect all valid (non-zero-usage) assistant turns from the tail.
@@ -76,7 +84,32 @@ fn parse_transcript(
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+
+        let turn_type = obj.get("type").and_then(|v| v.as_str());
+
+        if turn_type == Some("human") || turn_type == Some("user") {
+            // Attribute tool_result errors to the preceding assistant turn.
+            if let Some(content) = obj
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for block in content {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                        let is_error = block
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if let Some(last_turn) = turns.last_mut() {
+                            last_turn.error_flags.push(is_error);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if turn_type != Some("assistant") {
             continue;
         }
 
@@ -114,12 +147,40 @@ fn parse_transcript(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        let stop_reason_max_tokens =
+            msg.get("stop_reason").and_then(|v| v.as_str()) == Some("max_tokens");
+
+        // Extract tool_use blocks (structure only; input is hashed, never stored — CODERULES r11).
+        let tool_calls: Vec<(String, u64)> = msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|block| {
+                        if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                            return None;
+                        }
+                        let name = block.get("name").and_then(|v| v.as_str())?.to_string();
+                        let input_val = block.get("input").unwrap_or(&Value::Null);
+                        let canonical = serde_json::to_string(input_val).unwrap_or_default();
+                        let mut hasher = DefaultHasher::new();
+                        canonical.hash(&mut hasher);
+                        Some((name, hasher.finish()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         turns.push(TurnData {
             input,
             cache_read,
             cache_create,
             model,
             ts: ts_opt,
+            tool_calls,
+            error_flags: Vec::new(),
+            stop_reason_max_tokens,
         });
     }
 
@@ -129,12 +190,12 @@ fn parse_transcript(
     }
 
     if turns.is_empty() {
-        return (None, None, None);
+        return (None, None, None, None);
     }
 
     // Last valid turn → WindowInfo. Timestamp bound to this turn only (B1).
     let Some(last) = turns.last() else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let window_info = compute_window_info(
         last.input,
@@ -172,7 +233,20 @@ fn parse_transcript(
         None
     };
 
-    (Some(window_info), last_ts, trend)
+    // Collect behavior signals bounded to the last TREND_TAIL_K turns.
+    let all_calls: Vec<(String, u64)> = turns
+        .iter()
+        .flat_map(|t| t.tool_calls.iter().cloned())
+        .collect();
+    let error_flags: Vec<bool> = turns
+        .iter()
+        .flat_map(|t| t.error_flags.iter().copied())
+        .collect();
+    let stop_reason_max_tokens = turns.iter().any(|t| t.stop_reason_max_tokens);
+    let behavior_signals =
+        BehaviorSignals::from_signals(&all_calls, &error_flags, stop_reason_max_tokens);
+
+    (Some(window_info), last_ts, trend, behavior_signals)
 }
 
 fn agent_id_from_stem(stem: &str) -> Option<String> {
@@ -217,7 +291,7 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
 
     for (_, name, path) in jsonl_files {
         let uuid = name.trim_end_matches(".jsonl").to_string();
-        let (window, last_turn_at, trend) = parse_transcript(&path, backstop);
+        let (window, last_turn_at, trend, behavior_signals) = parse_transcript(&path, backstop);
         parents.push(SessionNode {
             session_uuid: uuid,
             agent_id: None,
@@ -226,6 +300,7 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
             children: Vec::new(),
             last_turn_at,
             trend,
+            behavior: behavior_signals,
         });
     }
 
@@ -262,7 +337,8 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
                     continue;
                 }
                 let agent_id = agent_id_from_stem(sub_stem);
-                let (window, last_turn_at, trend) = parse_transcript(&sub_path, backstop);
+                let (window, last_turn_at, trend, behavior_signals) =
+                    parse_transcript(&sub_path, backstop);
                 children.push(SessionNode {
                     session_uuid: parent_uuid.clone(),
                     agent_id,
@@ -271,6 +347,7 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
                     children: Vec::new(),
                     last_turn_at,
                     trend,
+                    behavior: behavior_signals,
                 });
             }
             child_map.insert(parent_uuid, children);
@@ -735,6 +812,76 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_behavior_failure_streak_claude() {
+        let tmp = std::env::temp_dir().join("brim_test_streak");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let uuid = "33330000-0000-0000-0000-000000000001";
+        // Three consecutive assistant turns, each with a tool_use, followed by
+        // human turns with is_error=true tool_result blocks (3 consecutive failures)
+        let lines = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+            "{\"type\":\"human\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"is_error\":true,\"content\":\"error1\"}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+            "{\"type\":\"human\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t2\",\"is_error\":true,\"content\":\"error2\"}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:02:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+            "{\"type\":\"human\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t3\",\"is_error\":true,\"content\":\"error3\"}]}}\n",
+        );
+        std::fs::write(tmp.join(format!("{uuid}.jsonl")), lines).unwrap();
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        let streak = sessions[0].behavior.as_ref().and_then(|b| b.failure_streak);
+        assert_eq!(
+            streak,
+            Some(3),
+            "3 consecutive is_error=true → failure_streak==3"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_behavior_stop_reason_max_tokens() {
+        let tmp = std::env::temp_dir().join("brim_test_stop_reason");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let uuid = "33330000-0000-0000-0000-000000000002";
+        let jsonl = "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"stop_reason\":\"max_tokens\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}\n";
+        std::fs::write(tmp.join(format!("{uuid}.jsonl")), jsonl).unwrap();
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        let smt = sessions[0]
+            .behavior
+            .as_ref()
+            .map(|b| b.stop_reason_max_tokens)
+            .unwrap_or(false);
+        assert!(smt, "stop_reason=max_tokens → stop_reason_max_tokens==true");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_behavior_ping_pong_claude() {
+        let tmp = std::env::temp_dir().join("brim_test_pingpong");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let uuid = "33330000-0000-0000-0000-000000000003";
+        // A→B→A pattern: Bash(ls), Read(/foo), Bash(ls)
+        let lines = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:01:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"/foo\"}}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-06-25T10:02:00Z\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":100},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+        );
+        std::fs::write(tmp.join(format!("{uuid}.jsonl")), lines).unwrap();
+        let sessions = discover_project(&tmp, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert_eq!(sessions.len(), 1);
+        let pp = sessions[0]
+            .behavior
+            .as_ref()
+            .and_then(|b| b.ping_pong_count);
+        assert!(pp.is_some_and(|c| c >= 1), "A→B→A → ping_pong_count >= 1");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // UNIX_EPOCH fallback sorts oldest: a file whose mtime is UNIX_EPOCH is dropped first

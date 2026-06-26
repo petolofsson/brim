@@ -231,6 +231,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at,
             trend: None,
+            behavior: None,
         }
     }
 
@@ -285,6 +286,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: Some(Utc::now() - chrono::Duration::minutes(5)),
             trend: None,
+            behavior: None,
         };
         let parent = SessionNode {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
@@ -299,6 +301,7 @@ mod tests {
             children: vec![child],
             last_turn_at: Some(Utc::now() - chrono::Duration::hours(2)),
             trend: None,
+            behavior: None,
         };
         let mut sessions = vec![parent];
         sessions.retain(|s| any_active(s, 30));
@@ -352,7 +355,9 @@ mod tests {
                 points: Vec::new(),
                 velocity_tokens_per_turn: velocity,
                 projected_turns_to_recycle: Some(p),
+                drift_score: None,
             }),
+            behavior: None,
         }
     }
 
@@ -467,7 +472,7 @@ mod tests {
     fn subtree_worst_verdict_propagates_naming_offending_node() {
         let thresholds = Thresholds::default();
         let parent_uuid = "pppp0000-0000-0000-0000-000000000000";
-        // root: 10k tokens → Ok; child_b: 150k → Over (above absolute_recycle_backstop 128k)
+        // root: 10k → Ok; child_b: 40k + projection=1 → Volume+Speed (2 families) → Over
         let mut root = make_node(parent_uuid, None, 10_000, None, None);
         let child_a = make_node(
             parent_uuid,
@@ -479,9 +484,9 @@ mod tests {
         let child_b = make_node(
             parent_uuid,
             Some("bbbb0000-0000-0000-0000-bbbbbbbbbbbb"),
-            150_000, // above 128k backstop → Over
-            None,
-            None,
+            40_000,  // volume fires (>= watch 32k)
+            Some(1), // speed fires (1 <= PROJECTION_NEARING_TURNS=5) → 2 families → Over
+            Some(5_000),
         );
         root.children = vec![child_a, child_b];
 
@@ -514,9 +519,9 @@ mod tests {
         let over_node = make_node(
             "over0000-0000-0000-0000-000000000000",
             None,
-            150_000, // above backstop (128k) → Over
-            None,
-            None,
+            40_000,  // volume fires (>= watch 32k)
+            Some(1), // speed fires (1 <= PROJECTION_NEARING_TURNS=5) → 2 families → Over
+            Some(5_000),
         );
 
         let mut pairs: Vec<(SubtreeInfo, SessionNode)> = vec![ok_node, nearing_node, over_node]

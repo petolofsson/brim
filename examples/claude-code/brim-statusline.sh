@@ -29,10 +29,10 @@ if command -v timeout >/dev/null 2>&1; then
 else
     brim_out=$(brim --session="$session_id" --watch-tokens 96000 --json 2>/dev/null)
 fi
-v=$(printf '%s' "$brim_out" | jq -r '.nodes[0].verdict // empty' 2>/dev/null)
 tokens=$(printf '%s' "$brim_out" | jq '.nodes[0].window_tokens // 0' 2>/dev/null)
+tier=$(printf '%s' "$brim_out" | jq -r '.nodes[0].tier // empty' 2>/dev/null)
 
-if [ -z "$v" ]; then
+if [ -z "$tier" ]; then
     printf '◈ brim --\n'  # REQ-015: parse failure → neutral fallback
     exit 0
 fi
@@ -40,30 +40,24 @@ fi
 # occupancy % = floor(tokens * 100 / 128000)
 occupancy=$(printf '%s' "$tokens" | awk '{printf "%d", ($1 * 100 / 128000)}')
 
-# --- determine stage (1..5) = max(occ_stage, verdict_stage) ---
-if   [ "$occupancy" -ge 400 ]; then occ_stage=5
-elif [ "$occupancy" -ge 200 ]; then occ_stage=4
-elif [ "$occupancy" -ge 100 ]; then occ_stage=3
-elif [ "$occupancy" -ge 75  ]; then occ_stage=2
-else                                 occ_stage=1
-fi
-case "$v" in
-    ok)           verdict_stage=1 ;;
-    nearing)      verdict_stage=2 ;;
-    over_recycle) verdict_stage=3 ;;
-    *)            verdict_stage=1 ;;
+# --- determine stage (1..5) from tier (ADR-025) ---
+case "$tier" in
+    lean)     stage=1 ;;
+    drift)    stage=2 ;;
+    bloated)  stage=3 ;;
+    stale)    stage=4 ;;
+    critical) stage=5 ;;
+    *)        stage=1 ;;
 esac
-stage=$occ_stage
-[ "$verdict_stage" -gt "$stage" ] && stage=$verdict_stage
 
-# --- stage → label, color ---
+# --- stage → color ---
 case "$stage" in
-    1) label='lean';     color="$GREEN"    ;;
-    2) label='drift';    color="$YELLOW"   ;;
-    3) label='bloated';  color="$ORANGE"   ;;
-    4) label='stale';    color="$RED"      ;;
-    5) label='critical'; color="$RED_BOLD" ;;
-    *) label='?';        color="$RESET"    ;;
+    1) color="$GREEN"    ;;
+    2) color="$YELLOW"   ;;
+    3) color="$ORANGE"   ;;
+    4) color="$RED"      ;;
+    5) color="$RED_BOLD" ;;
+    *) color="$RESET"    ;;
 esac
 
 # --- build 5-block BAR: STAGE filled (■) then padded (□) ---
@@ -73,6 +67,6 @@ for i in 1 2 3 4 5; do
 done
 
 # --- render (SC2059: ANSI vars passed as args, not in format string) ---
-printf '◈ brim %s%s%s %s%% %s\n' "$color" "$bar" "$RESET" "$occupancy" "$label"
+printf '◈ brim %s%s%s %s%% %s\n' "$color" "$bar" "$RESET" "$occupancy" "$tier"
 
 exit 0
