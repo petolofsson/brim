@@ -12,11 +12,15 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
+    verdict::BehaviorSignals,
     window::{TREND_TAIL_K, compute_trend},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+};
 
 /// Max sessions enumerated (CODERULES r3).
 const MAX_SESSIONS: usize = 256;
@@ -88,11 +92,14 @@ fn parse_session_dir(dir: &Path, log_root: &Path, backstop: u64) -> Option<Sessi
     let created_ts = parse_yaml_timestamp(&workspace, "created_at");
     let updated_ts = parse_yaml_timestamp(&workspace, "updated_at");
 
-    let event_ts = if dir.join("events.jsonl").exists() {
-        let tail = read_tail(&dir.join("events.jsonl")).unwrap_or_default();
-        extract_event_timestamp(&tail)
-    } else {
-        None
+    let (event_ts, behavior) = {
+        let events_path = dir.join("events.jsonl");
+        if events_path.exists() {
+            let tail = read_tail(&events_path).unwrap_or_default();
+            (extract_event_timestamp(&tail), extract_copilot_behavior(&tail))
+        } else {
+            (None, None)
+        }
     };
 
     // Point-in-time occupancy from process log (REQ-009).
@@ -110,7 +117,7 @@ fn parse_session_dir(dir: &Path, log_root: &Path, backstop: u64) -> Option<Sessi
         children: Vec::new(),
         last_turn_at,
         trend,
-        behavior: None, // Copilot process-log source does not carry tool_use structure; Behavior family cannot fire for this provider.
+        behavior,
     })
 }
 
@@ -249,6 +256,65 @@ fn extract_project_key(workspace: &str) -> String {
     String::new()
 }
 
+/// Extract BehaviorSignals from a Copilot events.jsonl tail.
+/// Live-verified schema (2026-06-26): tool.execution_start carries data.toolName and
+/// data.arguments (object); tool.execution_complete carries data.success (bool) and
+/// data.toolTelemetry.metrics.exit_code (i64). error_flag = success==false OR
+/// exit_code != 0 (ADR-031). Missing/unparseable exit_code treated as no-error.
+/// No max-tokens stop signal is present in events.jsonl, so stop_reason_max_tokens=false.
+fn extract_copilot_behavior(tail: &str) -> Option<BehaviorSignals> {
+    let mut tool_calls: Vec<(String, u64)> = Vec::new();
+    let mut error_flags: Vec<bool> = Vec::new();
+
+    for line in tail.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let event_type = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let Some(data) = v.get("data") else {
+            continue;
+        };
+        match event_type {
+            "tool.execution_start" => {
+                let Some(name) = data.get("toolName").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let args_str = data
+                    .get("arguments")
+                    .map(|x| x.to_string())
+                    .unwrap_or_default();
+                let mut hasher = DefaultHasher::new();
+                args_str.hash(&mut hasher);
+                tool_calls.push((name.to_string(), hasher.finish()));
+            }
+            "tool.execution_complete" => {
+                let success_false =
+                    data.get("success").and_then(|x| x.as_bool()) == Some(false);
+                let exit_error = data
+                    .get("toolTelemetry")
+                    .and_then(|t| t.get("metrics"))
+                    .and_then(|m| m.get("exit_code"))
+                    .and_then(|e| e.as_i64())
+                    .map(|code| code != 0)
+                    .unwrap_or(false);
+                error_flags.push(success_false || exit_error);
+            }
+            _ => {}
+        }
+    }
+
+    let start = tool_calls.len().saturating_sub(TREND_TAIL_K);
+    let tool_calls = &tool_calls[start..];
+    let start = error_flags.len().saturating_sub(TREND_TAIL_K);
+    let error_flags = &error_flags[start..];
+
+    BehaviorSignals::from_signals(tool_calls, error_flags, false)
+}
+
 /// Scan events.jsonl tail for a timestamp; events carry no point-in-time occupancy.
 fn extract_event_timestamp(tail: &str) -> Option<DateTime<Utc>> {
     let mut shutdown_ts: Option<DateTime<Utc>> = None;
@@ -299,6 +365,84 @@ fn find_last_event_timestamp(tail: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::verdict::ABSOLUTE_RECYCLE_BACKSTOP;
+
+    // ── extract_copilot_behavior ─────────────────────────────────────────────
+
+    #[test]
+    fn test_copilot_behavior_start_complete_success() {
+        // Real schema: tool.execution_start + tool.execution_complete with success=true.
+        let tail = r#"{"type":"tool.execution_start","data":{"toolCallId":"call_abc","toolName":"glob","arguments":{"pattern":"**/*","paths":"/home/pol/code"},"turnId":"0"},"timestamp":"2026-06-23T21:33:07Z"}
+{"type":"tool.execution_complete","data":{"toolCallId":"call_abc","success":true,"turnId":"0"},"timestamp":"2026-06-23T21:33:07Z"}"#;
+        let b = extract_copilot_behavior(tail).expect("behavior present");
+        // success=true → no failure_streak
+        assert!(b.failure_streak.is_none());
+        // one unique call → no repetition_run
+        assert!(b.repetition_run.is_none());
+        assert!(!b.stop_reason_max_tokens);
+    }
+
+    #[test]
+    fn test_copilot_behavior_failure_flag() {
+        // success=false → error_flag → failure_streak=1
+        let tail = r#"{"type":"tool.execution_start","data":{"toolCallId":"call_x1","toolName":"bash","arguments":{"command":"ls"},"turnId":"0"},"timestamp":"2026-06-23T21:00:00Z"}
+{"type":"tool.execution_complete","data":{"toolCallId":"call_x1","success":false,"turnId":"0"},"timestamp":"2026-06-23T21:00:01Z"}"#;
+        let b = extract_copilot_behavior(tail).expect("behavior present");
+        assert_eq!(b.failure_streak, Some(1));
+    }
+
+    #[test]
+    fn test_copilot_behavior_exit_code_nonzero_triggers_failure() {
+        // Real shape: success:true but toolTelemetry.metrics.exit_code:1 → failure_streak=1.
+        let tail = r#"{"type":"tool.execution_start","data":{"toolCallId":"call_ec1","toolName":"bash","arguments":{"command":"cat /tmp/nope.txt"},"turnId":"0"},"timestamp":"2026-06-26T15:24:33Z"}
+{"type":"tool.execution_complete","data":{"toolCallId":"call_ec1","success":true,"turnId":"0","toolTelemetry":{"properties":{"shell_error_category":"command_nonzero_exit"},"metrics":{"commandTimeout":30000,"exit_code":1}}},"timestamp":"2026-06-26T15:24:33Z"}"#;
+        let b = extract_copilot_behavior(tail).expect("behavior present");
+        assert_eq!(b.failure_streak, Some(1), "exit_code:1 with success:true must fire failure_streak");
+    }
+
+    #[test]
+    fn test_copilot_behavior_repetition_run() {
+        // Same toolName + same arguments hash → repetition_run.
+        let start = |id: &str| {
+            format!(
+                r#"{{"type":"tool.execution_start","data":{{"toolCallId":"{id}","toolName":"view","arguments":{{"path":"/same/path"}},"turnId":"0"}},"timestamp":"2026-06-23T21:00:00Z"}}"#
+            )
+        };
+        let complete = |id: &str| {
+            format!(
+                r#"{{"type":"tool.execution_complete","data":{{"toolCallId":"{id}","success":true,"turnId":"0"}},"timestamp":"2026-06-23T21:00:01Z"}}"#
+            )
+        };
+        let tail = format!(
+            "{}\n{}\n{}\n{}\n",
+            start("c1"),
+            complete("c1"),
+            start("c2"),
+            complete("c2")
+        );
+        let b = extract_copilot_behavior(&tail).expect("behavior present");
+        assert_eq!(b.repetition_run, Some(2), "two identical calls → run of 2");
+    }
+
+    #[test]
+    fn test_copilot_behavior_malformed_skipped() {
+        let tail =
+            "{not valid json}\n{\"type\":\"tool.execution_start\",\"data\":{\"toolCallId\":\"c1\",\"toolName\":\"grep\",\"arguments\":{\"q\":\"x\"},\"turnId\":\"0\"},\"timestamp\":\"2026-06-23T21:00:00Z\"}\n{\"type\":\"tool.execution_complete\",\"data\":{\"toolCallId\":\"c1\",\"success\":false,\"turnId\":\"0\"},\"timestamp\":\"2026-06-23T21:00:01Z\"}";
+        let b = extract_copilot_behavior(tail).expect("behavior present despite bad line");
+        assert_eq!(b.failure_streak, Some(1));
+    }
+
+    #[test]
+    fn test_copilot_behavior_empty_tail_none() {
+        assert!(extract_copilot_behavior("").is_none());
+        assert!(extract_copilot_behavior("   \n   ").is_none());
+    }
+
+    #[test]
+    fn test_copilot_behavior_non_tool_events_ignored() {
+        let tail = "{\"type\":\"session.start\",\"data\":{\"sessionId\":\"s1\"},\"timestamp\":\"2026-06-23T21:00:00Z\"}\n{\"type\":\"session.model_change\",\"data\":{\"newModel\":\"gpt-5-mini\"},\"timestamp\":\"2026-06-23T21:00:01Z\"}";
+        // No tool events → None
+        assert!(extract_copilot_behavior(tail).is_none());
+    }
 
     // ── process-log line parsing ─────────────────────────────────────────────
 
