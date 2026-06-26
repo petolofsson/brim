@@ -1,13 +1,15 @@
 //! opencode provider — reads the SQLite transcript DB at
 //! `$HOME/.local/share/opencode/opencode.db` (see REQ-008 / ADR-005).
 //!
-//! Last-turn oracle: the latest `part` row with
-//! `json_extract(data,'$.type')='step-finish'`; its `data.tokens` carries
+//! Last-turn oracle: prefers `session_message` rows where `type='step-finish'`
+//! (new opencode schema, native `type`+`seq` columns); falls back to the old
+//! `part` table query (`json_extract(data,'$.type')='step-finish'`) for older
+//! DBs. Step-finish `data.tokens` carries
 //! `{ total?, input, output?, cache: { read, write } }`.
 //! Window occupancy: prefer `tokens.total` when present; else sum
 //! `input + output + cache.read + cache.write`.
 //!
-//! If no `step-finish` part exists for a session (pre-checkpoint), brim falls
+//! If no `step-finish` row exists for a session (pre-checkpoint), brim falls
 //! back to the `session` aggregate token columns and tags the node with
 //! `window_source = "aggregate"` (ADR-002's "approximate or unavailable" case).
 
@@ -266,23 +268,7 @@ fn step_finish_oracle(
     model: &str,
     backstop: u64,
 ) -> StepFinishResult {
-    let mut stmt = conn
-        .prepare(
-            "SELECT data, time_created FROM part
-             WHERE session_id = ?1
-               AND json_extract(data, '$.type') = 'step-finish'
-             ORDER BY time_created DESC
-             LIMIT ?2",
-        )
-        .ok()?;
-
-    let raw: Vec<(Option<String>, i64)> = stmt
-        .query_map(params![session_id, TREND_TAIL_K as i64], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
-        })
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
+    let raw = fetch_step_finish_rows(conn, session_id);
 
     if raw.is_empty() {
         return None;
@@ -376,6 +362,58 @@ fn step_finish_oracle(
     Some((last_window, last_ts, trend))
 }
 
+/// Fetch step-finish rows for a session: try `session_message` (new schema),
+/// fall back to old `part` table. Both queries return DESC; caller reverses.
+fn fetch_step_finish_rows(conn: &Connection, session_id: &str) -> Vec<(Option<String>, i64)> {
+    if let Some(rows) = try_session_message(conn, session_id)
+        && !rows.is_empty()
+    {
+        return rows;
+    }
+    try_part(conn, session_id).unwrap_or_default()
+}
+
+/// Query `session_message` for step-finish rows (new opencode schema).
+/// Returns None when the table is absent (prepare fails → treated as "not available").
+fn try_session_message(conn: &Connection, session_id: &str) -> Option<Vec<(Option<String>, i64)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT data, time_created FROM session_message
+             WHERE session_id = ?1 AND type = 'step-finish'
+             ORDER BY seq DESC LIMIT ?2",
+        )
+        .ok()?;
+    let rows: Vec<_> = stmt
+        .query_map(params![session_id, TREND_TAIL_K as i64], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    Some(rows)
+}
+
+/// Query old `part` table for step-finish rows (older opencode schema).
+/// Returns None when the table is absent.
+fn try_part(conn: &Connection, session_id: &str) -> Option<Vec<(Option<String>, i64)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT data, time_created FROM part
+             WHERE session_id = ?1
+               AND json_extract(data, '$.type') = 'step-finish'
+             ORDER BY time_created DESC LIMIT ?2",
+        )
+        .ok()?;
+    let rows: Vec<_> = stmt
+        .query_map(params![session_id, TREND_TAIL_K as i64], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    Some(rows)
+}
+
 /// Fallback: build an Aggregate WindowInfo from the session's cumulative columns.
 fn aggregate_window(row: &SessionRow, model: &str) -> Option<WindowInfo> {
     let input = row.tokens_input.max(0) as u64;
@@ -421,7 +459,54 @@ mod tests {
     use rusqlite::Connection;
 
     /// Open an in-memory sqlite db with the opencode schema seed the tests need.
+    /// Includes both `session_message` (new) and `part` (old) tables.
     fn seed_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                agent TEXT,
+                model TEXT,
+                directory TEXT,
+                project_id TEXT,
+                tokens_input INTEGER DEFAULT 0,
+                tokens_cache_read INTEGER DEFAULT 0,
+                tokens_cache_write INTEGER DEFAULT 0,
+                tokens_output INTEGER DEFAULT 0,
+                tokens_reasoning INTEGER DEFAULT 0,
+                cost REAL DEFAULT 0,
+                time_created INTEGER DEFAULT 0,
+                time_updated INTEGER DEFAULT 0
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                type TEXT,
+                seq INTEGER,
+                time_created INTEGER DEFAULT 0,
+                time_updated INTEGER DEFAULT 0,
+                data TEXT
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                type TEXT,
+                time_created INTEGER DEFAULT 0,
+                data TEXT
+            );
+            CREATE TABLE project (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                worktree TEXT
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Like seed_db() but without session_message — simulates old opencode schema.
+    fn seed_db_old_schema() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE session (
@@ -792,5 +877,107 @@ mod tests {
         let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
         let w = nodes[0].window.as_ref().unwrap();
         assert_eq!(w.window_tokens, 150);
+    }
+
+    // session_message preferred over part when both have step-finish rows.
+    #[test]
+    fn test_session_message_preferred_over_part() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_sm', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // session_message row: 30000 tokens
+        let sm_data = serde_json::json!({
+            "type": "step-finish", "time": 1719000000000_i64,
+            "tokens": { "total": 30000u64 }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, data)
+             VALUES ('sm1','ses_sm','step-finish',1,1719000000000,?1)",
+            params![sm_data],
+        )
+        .unwrap();
+        // part row with different token count (99999) — must NOT win
+        let part_data = serde_json::json!({
+            "type": "step-finish", "time": 1719000000000_i64,
+            "tokens": { "total": 99999u64 }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, type, time_created, data)
+             VALUES ('pm1','ses_sm','step-finish',1719000000000,?1)",
+            params![part_data],
+        )
+        .unwrap();
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let w = nodes[0].window.as_ref().unwrap();
+        assert_eq!(
+            w.window_tokens, 30_000,
+            "session_message must win over part"
+        );
+        assert_eq!(w.window_source, WindowSource::LastTurn);
+    }
+
+    // Falls back to part table when session_message is absent (old opencode schema).
+    #[test]
+    fn test_falls_back_to_part_when_no_session_message() {
+        let conn = seed_db_old_schema();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_old', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        let part_data = serde_json::json!({
+            "type": "step-finish", "time": 1719000000000_i64,
+            "tokens": { "total": 55000u64 }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, type, time_created, data)
+             VALUES ('po_old','ses_old','step-finish',1719000000000,?1)",
+            params![part_data],
+        )
+        .unwrap();
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let w = nodes[0].window.as_ref().unwrap();
+        assert_eq!(w.window_tokens, 55_000, "part fallback must fire");
+        assert_eq!(w.window_source, WindowSource::LastTurn);
+    }
+
+    // session_message table present but has no step-finish rows for this session
+    // → must fall through to part.
+    #[test]
+    fn test_falls_back_to_part_when_session_message_empty() {
+        let conn = seed_db();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, project_id, time_updated)
+             VALUES ('ses_sm_empty', ?1, '/x', NULL, 1719000000000)",
+            params![model_json("z-ai/glm-5.2")],
+        )
+        .unwrap();
+        // No session_message rows for this session; part has a step-finish row.
+        let part_data = serde_json::json!({
+            "type": "step-finish", "time": 1719000000000_i64,
+            "tokens": { "total": 42000u64 }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO part (id, session_id, type, time_created, data)
+             VALUES ('pe1','ses_sm_empty','step-finish',1719000000000,?1)",
+            params![part_data],
+        )
+        .unwrap();
+        let nodes = discover_sessions(&conn, ABSOLUTE_RECYCLE_BACKSTOP);
+        let w = nodes[0].window.as_ref().unwrap();
+        assert_eq!(
+            w.window_tokens, 42_000,
+            "part must be read when session_message table is present but empty for session"
+        );
+        assert_eq!(w.window_source, WindowSource::LastTurn);
     }
 }

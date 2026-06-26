@@ -8,6 +8,7 @@ related_requirements:
 related_adrs:
   - ADR-002
   - ADR-005
+  - ADR-027
 related_stories: [STORY-009]
 related_tests:
   - TEST-004
@@ -24,17 +25,25 @@ related_tests:
 * The system shall mark the opencode provider unavailable (not error) when the
   database file is absent; availability is a cheap path check on the file only.
 * The system shall compute the point-in-time last-turn window from the latest
-  `part` row for the session where `json_extract(data,'$.type')='step-finish'`,
-  ordered by `time_created DESC LIMIT 1` (SQL-side bound; no full part scan in
-  Rust). From that part's `data.tokens`:
+  step-finish row, with this source precedence (ADR-027):
+  1. **Preferred** — the latest `session_message` row for the session where the
+     native `type` column = `'step-finish'`, ordered by `seq DESC LIMIT 1`
+     (new opencode schema).
+  2. **Fallback** — when `session_message` is absent or has no step-finish row
+     for the session, the latest `part` row where
+     `json_extract(data,'$.type')='step-finish'`, ordered by
+     `time_created DESC LIMIT 1` (old opencode schema). A missing table is
+     detected by `prepare()` failure and treated as "not available".
+  Both queries are SQL-side bound (no full scan in Rust). From the chosen row's
+  `data.tokens`:
   * `input` maps to `input_tokens`,
   * `cache.read` maps to `cache_read_input_tokens`,
   * `cache.write` maps to `cache_creation_input_tokens`,
   * `window_tokens = input + cache.read + cache.write` (saturating add).
-* The system shall fall back, when no `step-finish` part exists for a session,
-  to the `session` aggregate columns `tokens_input + tokens_cache_read +
-  tokens_cache_write`, and tag the resulting `WindowInfo` with
-  `window_source = "aggregate"`.
+* The system shall fall back, when no `step-finish` row exists for a session in
+  either `session_message` or `part`, to the `session` aggregate columns
+  `tokens_input + tokens_cache_read + tokens_cache_write`, and tag the resulting
+  `WindowInfo` with `window_source = "aggregate"`.
 * The system shall expose `window_source` (`"last_turn"` | `"aggregate"`) in the
   `--json` output so a consumer can distinguish point-in-time from cumulative
   occupancy (REQ-005 machine-readable; ADR-002 explicitly warns cumulative ≠
@@ -54,13 +63,16 @@ related_tests:
 
 ## Rationale
 
-opencode stores transcripts in SQLite (not JSONL), and `part` rows of type
-`step-finish` carry the same point-in-time usage signal claude's last `assistant`
-turn does. The `session` table additionally holds cumulative token aggregates,
-which are NOT window occupancy (ADR-002). When step-finish parts exist they win;
-when they do not (pre-checkpoint sessions) the aggregate is the documented
-"approximate or unavailable" case ADR-002 permits, and brim explicitly tags it
-so the consumer does not mistake cumulative for point-in-time.
+opencode stores transcripts in SQLite (not JSONL), and step-finish rows carry the
+same point-in-time usage signal claude's last `assistant` turn does. New opencode
+relocated those rows from the `part` table to a `session_message` table with
+native `type`+`seq` columns, so brim prefers `session_message` and falls back to
+the old `part` query for older DBs (ADR-027). The `session` table additionally
+holds cumulative token aggregates, which are NOT window occupancy (ADR-002). When
+a step-finish row exists it wins; when none does (pre-checkpoint sessions) the
+aggregate is the documented "approximate or unavailable" case ADR-002 permits,
+and brim explicitly tags it so the consumer does not mistake cumulative for
+point-in-time.
 
 ## Acceptance Criteria
 
