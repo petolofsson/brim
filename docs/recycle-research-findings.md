@@ -306,7 +306,6 @@ clear improvement over today, just short of the 80 bar.
 - **Label-model identifiability:** prototype the triplet estimator on real transcripts before
   trusting P2 math. Biggest single uncertainty.
 - **DeepNLP/Agent-Tool-Use dataset:** verify tool results + error flags, or drop.
-- **opencode `part` → `session_message` parser bug:** real correctness bug, separate unit.
 
 ## 12. Lore artifact map
 
