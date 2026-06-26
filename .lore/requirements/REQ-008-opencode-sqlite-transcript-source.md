@@ -60,8 +60,9 @@ related_tests:
 * `last_turn_at` for a session shall use the latest step-finish part's
   `time`/`time_created` when present, else `session.time_updated`. The same 30-min
   default / `--active-mins` / `--all` semantics apply as for claude (REQ-006).
-* Model context-window limit: `z-ai/glm-5.2` (and any opencode model id without
-  the `[1m]` marker) uses the existing 200_000 default. No model→limit registry.
+* Model context-window limit: the system shall apply **no** per-model
+  context-window limit and shall reason in absolute tokens (ADR-011 / ADR-020).
+  No model→limit registry exists; model id is display-only. See ADR-029.
 
 ## Rationale
 
