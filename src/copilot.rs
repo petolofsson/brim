@@ -110,7 +110,7 @@ fn parse_session_dir(dir: &Path, log_root: &Path, backstop: u64) -> Option<Sessi
         children: Vec::new(),
         last_turn_at,
         trend,
-        tool_repeat_run: None,
+        behavior: None, // Copilot process-log source does not carry tool_use structure; Behavior family cannot fire for this provider.
     })
 }
 

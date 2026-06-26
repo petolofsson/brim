@@ -17,11 +17,15 @@ use crate::{
     model::{SessionNode, TimelinePoint, WindowInfo, WindowSource, WindowTrend},
     parser::{home_dir, read_tail},
     provider::Provider,
+    verdict::BehaviorSignals,
     window::{TREND_TAIL_K, compute_trend, compute_window_info},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+};
 
 /// Max sessions enumerated (CODERULES r3).
 const MAX_SESSIONS: usize = 256;
@@ -89,6 +93,68 @@ fn collect_sessions(sessions_dir: &Path, backstop: u64) -> Vec<SessionNode> {
         .collect()
 }
 
+/// Extract BehaviorSignals from a Codex session JSONL tail.
+/// schema-confirmed; not live-data validated
+fn extract_codex_behavior(tail: &str) -> Option<BehaviorSignals> {
+    let mut tool_calls: Vec<(String, u64)> = Vec::new();
+    let mut error_flags: Vec<bool> = Vec::new();
+    let mut stop_reason_max_tokens = false;
+
+    for line in tail.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+
+        // finish_reason == "length" → context-length stop (Codex/OpenAI convention)
+        if v.get("finish_reason").and_then(|x| x.as_str()) == Some("length")
+            || v.get("payload")
+                .and_then(|p| p.get("finish_reason"))
+                .and_then(|x| x.as_str())
+                == Some("length")
+        {
+            stop_reason_max_tokens = true;
+        }
+
+        // Extract function_call blocks from content[] or payload.content[]
+        let content = v.get("content").and_then(|c| c.as_array()).or_else(|| {
+            v.get("payload")
+                .and_then(|p| p.get("content"))
+                .and_then(|c| c.as_array())
+        });
+
+        if let Some(arr) = content {
+            for block in arr {
+                match block.get("type").and_then(|x| x.as_str()) {
+                    Some("function_call") => {
+                        let Some(name) = block.get("name").and_then(|x| x.as_str()) else {
+                            continue;
+                        };
+                        let args_raw = block
+                            .get("arguments")
+                            .map(|x| x.to_string())
+                            .unwrap_or_default();
+                        let mut hasher = DefaultHasher::new();
+                        args_raw.hash(&mut hasher);
+                        tool_calls.push((name.to_string(), hasher.finish()));
+                    }
+                    Some("function_call_output") => {
+                        let is_error =
+                            block.get("status").and_then(|x| x.as_str()) == Some("failed");
+                        error_flags.push(is_error);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    BehaviorSignals::from_signals(&tool_calls, &error_flags, stop_reason_max_tokens)
+}
+
 fn parse_session_file(path: &Path, backstop: u64) -> Option<SessionNode> {
     // Known limitations for >256KB sessions: the final turn-span may be
     // truncated; cwd and the full-span token header live before the tail window.
@@ -105,7 +171,7 @@ fn parse_session_file(path: &Path, backstop: u64) -> Option<SessionNode> {
         children: Vec::new(),
         last_turn_at,
         trend,
-        tool_repeat_run: None,
+        behavior: extract_codex_behavior(&tail),
     })
 }
 
@@ -607,6 +673,36 @@ mod tests {
         let w = window.expect("window present");
         assert_eq!(w.window_tokens, 10_000, "trailing dup must not zero window");
         assert_eq!(w.window_source, WindowSource::LastTurn);
+    }
+
+    #[test]
+    fn test_codex_behavior_repetition_extraction() {
+        // schema-confirmed; not live-data validated
+        let line1 = serde_json::json!({
+            "content": [
+                {"type": "function_call", "name": "Bash", "arguments": "{\"command\":\"ls\"}"}
+            ]
+        })
+        .to_string();
+        let line2 = serde_json::json!({
+            "content": [
+                {"type": "function_call", "name": "Bash", "arguments": "{\"command\":\"ls\"}"}
+            ]
+        })
+        .to_string();
+        let line3 = serde_json::json!({
+            "content": [
+                {"type": "function_call", "name": "Bash", "arguments": "{\"command\":\"ls\"}"}
+            ]
+        })
+        .to_string();
+        let tail = format!("{line1}\n{line2}\n{line3}\n");
+        let b = extract_codex_behavior(&tail).expect("behavior present");
+        assert_eq!(
+            b.repetition_run,
+            Some(3),
+            "3 identical function_calls → repetition_run==3"
+        );
     }
 
     // window_tokens formula: input_tokens (includes cached) = pure_input + cached.

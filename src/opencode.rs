@@ -206,7 +206,7 @@ pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
                 children: Vec::new(),
                 last_turn_at,
                 trend,
-                tool_repeat_run: None,
+                behavior: None, // opencode SQLite source does not carry tool_use parts in the queried part types; Behavior family cannot currently fire for this provider.
             },
         ));
     }

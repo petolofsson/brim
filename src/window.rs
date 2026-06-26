@@ -59,6 +59,20 @@ fn cache_hit_ratio(cache_read: u64, cache_create: u64, window_tokens: u64) -> Op
     Some((cache_read as f32 / window_tokens as f32).clamp(0.0, 1.0))
 }
 
+/// Compute a floor-trend score: last / min across all points.
+/// Returns None if fewer than 2 points or floor is 0.
+fn drift_score_from_slice(points: &[TimelinePoint]) -> Option<f32> {
+    if points.len() < 2 {
+        return None;
+    }
+    let floor = points.iter().map(|p| p.window_tokens).min().unwrap_or(0);
+    let last = points.last()?.window_tokens;
+    if floor == 0 {
+        return None;
+    }
+    Some(last as f32 / floor as f32)
+}
+
 /// Derive velocity and projection from a bounded per-turn timeline (ADR-006, ADR-022).
 ///
 /// Velocity = MAX of the most recent VELOCITY_WINDOW_W consecutive positive deltas
@@ -69,11 +83,14 @@ fn cache_hit_ratio(cache_read: u64, cache_create: u64, window_tokens: u64) -> Op
 /// Projection = (backstop − last_window) / velocity when velocity > 0;
 /// None when current >= backstop (already at or past the recycle backstop).
 pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
+    let drift_score = drift_score_from_slice(&points);
+
     if points.len() < 2 {
         return WindowTrend {
             points,
             velocity_tokens_per_turn: None,
             projected_turns_to_recycle: None,
+            drift_score,
         };
     }
 
@@ -91,6 +108,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
             points,
             velocity_tokens_per_turn: None,
             projected_turns_to_recycle: None,
+            drift_score,
         };
     }
 
@@ -107,6 +125,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
             points,
             velocity_tokens_per_turn: None,
             projected_turns_to_recycle: None,
+            drift_score,
         };
     }
 
@@ -118,6 +137,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
             points,
             velocity_tokens_per_turn: None,
             projected_turns_to_recycle: None,
+            drift_score,
         };
     };
     let current = last_pt.window_tokens;
@@ -131,6 +151,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
         points,
         velocity_tokens_per_turn: Some(velocity),
         projected_turns_to_recycle: projection,
+        drift_score,
     }
 }
 
@@ -479,6 +500,53 @@ mod tests {
             pt_ratio(2, 10_000, Some(at)),
         ];
         assert!(!sustained_cache_thrash(&points));
+    }
+
+    #[test]
+    fn test_drift_score_none_insufficient() {
+        let points = vec![pt(0, 10_000)];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        assert!(trend.drift_score.is_none(), "single point → None");
+    }
+
+    #[test]
+    fn test_drift_score_monotone_rising() {
+        let points = vec![
+            pt(0, 10_000),
+            pt(1, 12_000),
+            pt(2, 14_000),
+            pt(3, 16_000),
+            pt(4, 18_000),
+            pt(5, 20_000),
+            pt(6, 22_000),
+            pt(7, 24_000),
+        ];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        let s = trend.drift_score.expect("8 rising points → Some");
+        assert!(s > 1.0, "last(24k)/floor(10k) = 2.4 > 1.0");
+    }
+
+    #[test]
+    fn test_drift_score_fires_after_reset() {
+        // floor=10k (post-reset min), last=20k → score=2.0 > threshold 1.5
+        let points = vec![
+            pt(0, 50_000),
+            pt(1, 80_000),
+            pt(2, 10_000), // reset → new floor
+            pt(3, 15_000),
+            pt(4, 20_000),
+        ];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        let s = trend.drift_score.expect("reset scenario → Some");
+        assert!(s > 1.5, "last(20k)/floor(10k) = 2.0 > 1.5");
+    }
+
+    #[test]
+    fn test_drift_score_flat_no_growth() {
+        let points = vec![pt(0, 30_000), pt(1, 30_000), pt(2, 30_000)];
+        let trend = compute_trend(points, ABSOLUTE_RECYCLE_BACKSTOP);
+        let s = trend.drift_score.expect("flat → Some(1.0)");
+        assert!((s - 1.0).abs() < 1e-5, "flat series → score = 1.0");
     }
 
     #[test]

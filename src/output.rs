@@ -1,6 +1,6 @@
 use crate::model::{RecycleRecommendation, SessionNode, SubtreeInfo, compute_subtree};
 use crate::parser::short_id;
-use crate::verdict::{Thresholds, Verdict, absolute_verdict};
+use crate::verdict::{FamilyVoteInputs, Thresholds, Verdict, family_vote_verdict};
 use crate::window::sustained_cache_thrash;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -57,6 +57,16 @@ pub(crate) struct JsonRecycleRecommendation {
     blast_radius: Vec<JsonBlastRadiusEntry>,
 }
 
+#[derive(Serialize, Clone)]
+pub(crate) struct JsonFamilyVotes {
+    pub volume: bool,
+    pub speed: bool,
+    pub thrash: bool,
+    pub behavior: bool,
+    pub drift: bool,
+    pub count: u8,
+}
+
 #[derive(Serialize)]
 pub(crate) struct JsonOutput {
     pub(crate) nodes: Vec<JsonNode>,
@@ -97,10 +107,12 @@ pub(crate) struct JsonNode {
     /// Set for root nodes only; null for child nodes.
     #[serde(skip_serializing_if = "Option::is_none")]
     recycle_recommendation: Option<JsonRecycleRecommendation>,
-    /// PROVISIONAL/spike per ADR-024: max consecutive-identical tool-call run in the tail window.
-    /// Absent when no tool_use traffic in the window (ADR-013 slim contract unchanged when quiet).
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_repeat_run: Option<u32>,
+    tier: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    family_votes: Option<JsonFamilyVotes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decisive_override: Option<bool>,
     children: Vec<JsonNode>,
 }
 
@@ -129,28 +141,55 @@ pub(crate) fn to_json_node(
     active_mins: u32,
     rec: Option<JsonRecycleRecommendation>,
 ) -> JsonNode {
-    let (window_tokens, model, verdict, verdict_gate, window_source) =
-        if let Some(w) = node.window.as_ref() {
-            let trend = node.trend.as_ref();
-            let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
-            let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
-            let (v, gate) = absolute_verdict(
-                w.window_tokens,
-                projected_turns,
-                thrash,
-                thresholds.watch_tokens,
-                thresholds.recycle_backstop,
-            );
-            (
-                Some(w.window_tokens),
-                Some(w.model.clone()),
-                Some(v.as_json_str()),
-                gate.map(|g| g.as_json_str()),
-                Some(w.window_source.as_json_str()),
-            )
-        } else {
-            (None, None, None, None, None)
+    let (
+        window_tokens,
+        model,
+        verdict,
+        verdict_gate,
+        window_source,
+        tier,
+        family_votes,
+        decisive_override,
+    ) = if let Some(w) = node.window.as_ref() {
+        let trend = node.trend.as_ref();
+        let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
+        let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
+        let drift_score = trend.and_then(|t| t.drift_score);
+        let inputs = FamilyVoteInputs {
+            window_tokens: w.window_tokens,
+            watch_tokens: thresholds.watch_tokens,
+            projected_turns,
+            sustained_cache_thrash: thrash,
+            behavior: node.behavior.as_ref(),
+            drift_score,
         };
+        let result = family_vote_verdict(&inputs);
+        let fv = Some(JsonFamilyVotes {
+            volume: result.families[0],
+            speed: result.families[1],
+            thrash: result.families[2],
+            behavior: result.families[3],
+            drift: result.families[4],
+            count: result.count,
+        });
+        let do_override = if result.decisive_override {
+            Some(true)
+        } else {
+            None
+        };
+        (
+            Some(w.window_tokens),
+            Some(w.model.clone()),
+            Some(result.verdict.as_json_str()),
+            result.verdict_gate.map(|g| g.as_json_str()),
+            Some(w.window_source.as_json_str()),
+            Some(result.tier.as_json_str()),
+            fv,
+            do_override,
+        )
+    } else {
+        (None, None, None, None, None, None, None, None)
+    };
 
     // For sub-agents: session_id = agent_id (the sub-agent's own UUID).
     // For roots: session_id = session_uuid.
@@ -191,7 +230,9 @@ pub(crate) fn to_json_node(
         trend,
         subtree,
         recycle_recommendation: rec,
-        tool_repeat_run: node.tool_repeat_run,
+        tier,
+        family_votes,
+        decisive_override,
         children: node
             .children
             .iter()
@@ -258,16 +299,19 @@ pub(crate) fn verdict_str(node: &SessionNode, thresholds: &Thresholds) -> String
     let trend = node.trend.as_ref();
     let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
     let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
-    let (v, gate) = absolute_verdict(
-        w.window_tokens,
+    let drift_score = trend.and_then(|t| t.drift_score);
+    let inputs = FamilyVoteInputs {
+        window_tokens: w.window_tokens,
+        watch_tokens: thresholds.watch_tokens,
         projected_turns,
-        thrash,
-        thresholds.watch_tokens,
-        thresholds.recycle_backstop,
-    );
-    match gate {
-        Some(g) => format!("{} ({})", v.as_str(), g.as_str()),
-        None => v.as_str().to_string(),
+        sustained_cache_thrash: thrash,
+        behavior: node.behavior.as_ref(),
+        drift_score,
+    };
+    let result = family_vote_verdict(&inputs);
+    match result.verdict_gate {
+        Some(g) => format!("{} ({})", result.verdict.as_str(), g.as_str()),
+        None => result.verdict.as_str().to_string(),
     }
 }
 
@@ -468,7 +512,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
 
         let parent = SessionNode {
@@ -485,7 +529,7 @@ mod tests {
             children: vec![child],
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
 
         let parent_si = compute_subtree(&parent, &thresholds);
@@ -528,13 +572,13 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
-        // 190k >= ABSOLUTE_RECYCLE_BACKSTOP (128k) → Over via abs-backstop gate (ADR-010)
-        assert_eq!(jnode.verdict, Some("over_recycle"));
-        assert_eq!(jnode.verdict_gate, Some("absolute_backstop"));
+        // 190k >= ABSOLUTE_WATCH_TOKENS (32k) → volume fires (1 family) → Nearing via abs-watch gate (ADR-025)
+        assert_eq!(jnode.verdict, Some("nearing"));
+        assert_eq!(jnode.verdict_gate, Some("absolute_watch"));
     }
 
     #[test]
@@ -564,7 +608,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -603,8 +647,9 @@ mod tests {
                 }],
                 velocity_tokens_per_turn: Some(10_000),
                 projected_turns_to_recycle: Some(10),
+                drift_score: None,
             }),
-            tool_repeat_run: None,
+            behavior: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -638,7 +683,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
         // root with window + trend (so subtree aggregates and recycle rec populate)
         let parent = SessionNode {
@@ -654,7 +699,7 @@ mod tests {
             children: vec![child],
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
 
         let parent_si = compute_subtree(&parent, &thresholds);
@@ -679,8 +724,8 @@ mod tests {
         // root window present → window_tokens/verdict/verdict_gate/window_source/model emitted.
         assert!(node.get("window_tokens").is_some());
         assert!(node.get("verdict").is_some());
-        assert_eq!(node["verdict"], "over_recycle");
-        assert_eq!(node["verdict_gate"], "absolute_backstop");
+        assert_eq!(node["verdict"], "nearing");
+        assert_eq!(node["verdict_gate"], "absolute_watch");
 
         // (iii) nested keys are the short names (ADR-013 rename map).
         let sub = &node["subtree"];
@@ -786,7 +831,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
         // active root with known window_tokens.
         let root = SessionNode {
@@ -802,7 +847,7 @@ mod tests {
             children: vec![no_window_child],
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         };
 
         let si = compute_subtree(&root, &thresholds);

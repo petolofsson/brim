@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 
-use crate::verdict::{Thresholds, Verdict, VerdictGate, absolute_verdict};
+use crate::verdict::{
+    BehaviorSignals, FamilyVoteInputs, Thresholds, Verdict, VerdictGate, family_vote_verdict,
+};
 use crate::window::sustained_cache_thrash;
 
 /// Provenance of the reported window occupancy (REQ-005 machine-readable).
@@ -55,6 +57,8 @@ pub struct WindowTrend {
     pub points: Vec<TimelinePoint>,
     pub velocity_tokens_per_turn: Option<u64>,
     pub projected_turns_to_recycle: Option<u32>,
+    /// EWMA / floor-trend across compaction resets (ADR-025 Drift family).
+    pub drift_score: Option<f32>,
 }
 
 /// Aggregated health across a node and all its descendants (ADR-007).
@@ -96,14 +100,17 @@ pub fn compute_subtree(node: &SessionNode, thresholds: &Thresholds) -> SubtreeIn
         let trend = node.trend.as_ref();
         let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
         let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
-        let (v, _) = absolute_verdict(
-            w.window_tokens,
+        let drift_score = trend.and_then(|t| t.drift_score);
+        let inputs = FamilyVoteInputs {
+            window_tokens: w.window_tokens,
+            watch_tokens: thresholds.watch_tokens,
             projected_turns,
-            thrash,
-            thresholds.watch_tokens,
-            thresholds.recycle_backstop,
-        );
-        (w.window_tokens, v)
+            sustained_cache_thrash: thrash,
+            behavior: node.behavior.as_ref(),
+            drift_score,
+        };
+        let result = family_vote_verdict(&inputs);
+        (w.window_tokens, result.verdict)
     } else {
         (0, Verdict::Ok)
     };
@@ -255,13 +262,17 @@ fn self_verdict(node: &SessionNode, thresholds: &Thresholds) -> (Verdict, Option
         let trend = node.trend.as_ref();
         let projected_turns = trend.and_then(|t| t.projected_turns_to_recycle);
         let thrash = trend.is_some_and(|t| sustained_cache_thrash(&t.points));
-        absolute_verdict(
-            w.window_tokens,
+        let drift_score = trend.and_then(|t| t.drift_score);
+        let inputs = FamilyVoteInputs {
+            window_tokens: w.window_tokens,
+            watch_tokens: thresholds.watch_tokens,
             projected_turns,
-            thrash,
-            thresholds.watch_tokens,
-            thresholds.recycle_backstop,
-        )
+            sustained_cache_thrash: thrash,
+            behavior: node.behavior.as_ref(),
+            drift_score,
+        };
+        let result = family_vote_verdict(&inputs);
+        (result.verdict, result.verdict_gate)
     } else {
         (Verdict::Ok, None)
     }
@@ -351,9 +362,8 @@ pub struct SessionNode {
     pub last_turn_at: Option<DateTime<Utc>>,
     /// Velocity/projection trend from the last K turns (ADR-006). None if unavailable.
     pub trend: Option<WindowTrend>,
-    /// PROVISIONAL/spike per ADR-024: max consecutive-identical (tool_name, args_hash) run
-    /// across the tail window. None when no tool_use blocks in the window.
-    pub tool_repeat_run: Option<u32>,
+    /// Behavioral degradation signals (ADR-024/ADR-025). None = provider has no tool-use extraction.
+    pub behavior: Option<BehaviorSignals>,
 }
 
 #[cfg(test)]
@@ -379,7 +389,7 @@ mod tests {
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
-            tool_repeat_run: None,
+            behavior: None,
         }
     }
 
@@ -401,7 +411,7 @@ mod tests {
             rec.target_node_id, leaf_id,
             "leaf is deeper and explains Over"
         );
-        assert_eq!(rec.target_verdict, Verdict::Over);
+        assert_eq!(rec.target_verdict, Verdict::Nearing);
         assert!(!rec.is_root);
         assert!(rec.blast_radius.is_empty(), "leaf has no descendants");
     }
@@ -427,7 +437,7 @@ mod tests {
             rec.target_node_id, mid_id,
             "intermediate is Over while leaf is Ok"
         );
-        assert_eq!(rec.target_verdict, Verdict::Over);
+        assert_eq!(rec.target_verdict, Verdict::Nearing);
         assert!(!rec.is_root);
         // blast radius = leaf
         assert_eq!(rec.blast_radius.len(), 1);
@@ -450,7 +460,7 @@ mod tests {
 
         assert_eq!(rec.target_node_id, root_uuid);
         assert!(rec.is_root, "root-case must be flagged");
-        assert_eq!(rec.target_verdict, Verdict::Over);
+        assert_eq!(rec.target_verdict, Verdict::Nearing);
         // blast radius includes child
         assert_eq!(rec.blast_radius.len(), 1);
         assert_eq!(rec.blast_radius[0].node_id, child_id);
@@ -548,7 +558,7 @@ mod tests {
             rec.target_node_id, child_id,
             "child is deeper and shares Over verdict — depth wins"
         );
-        assert_eq!(rec.target_verdict, Verdict::Over);
+        assert_eq!(rec.target_verdict, Verdict::Nearing);
         assert!(!rec.is_root);
         assert!(rec.blast_radius.is_empty(), "child has no descendants");
     }
@@ -568,6 +578,7 @@ mod tests {
             points: vec![],
             velocity_tokens_per_turn: None,
             projected_turns_to_recycle: Some(2),
+            drift_score: None,
         });
 
         let mut root = mk(root_uuid, None, OK_TOKENS);
