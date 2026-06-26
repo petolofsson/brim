@@ -8,6 +8,7 @@ related_requirements:
 related_adrs:
   - ADR-005
   - ADR-012
+  - ADR-027
 related_stories: [STORY-009]
 related_tests: []
 ---
@@ -41,6 +42,19 @@ Covered by `src/opencode.rs::tests`. Cases:
    `load_sessions().is_empty()` without panicking.
 7. **No token data emits a null window.** A session with neither step-finish
    parts nor non-zero aggregate columns emits `window: None`.
+8. **session_message preferred over part (ADR-027).**
+   `test_session_message_preferred_over_part` — seed the new schema (both
+   `session_message` and `part`); a `session_message` step-finish row with
+   `tokens.total=30000` and a `part` step-finish row with `tokens.total=99999`.
+   The `session_message` row must win.
+9. **Fall back to part when session_message absent (old schema, ADR-027).**
+   `test_falls_back_to_part_when_no_session_message` — seed via
+   `seed_db_old_schema()` (no `session_message` table); a `part` step-finish row
+   with `tokens.total=55000`. The `part` oracle must fire.
+10. **Fall back to part when session_message present-but-empty (ADR-027).**
+    `test_falls_back_to_part_when_session_message_empty` — new schema, the
+    `session_message` table exists but has no step-finish row for the session;
+    a `part` step-finish row supplies the window.
 
 ## Expected Result
 
@@ -65,6 +79,14 @@ children.
 
 For cases 5–7: project keys and provider behavior exactly as stated; the
 null-token case emits `window: None` in the JSON (REQ-005 null fields).
+
+For case 8: `window_tokens = 30_000`, `window_source = LastTurn` — the
+`session_message` row wins; the larger `part` value (99_999) is ignored.
+For case 9: `window_tokens = 55_000`, `window_source = LastTurn` — the `part`
+fallback fires when `session_message` is absent.
+For case 10: the `part` step-finish row supplies the window, `window_source =
+LastTurn` — an empty `session_message` for the session falls through to `part`,
+not to the aggregate.
 
 All cases: `cargo test opencode` green; the full `cargo test` suite remains
 green (the `WindowInfo.window_source` field addition must not break claude tests).
