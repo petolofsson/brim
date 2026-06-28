@@ -209,11 +209,13 @@ pub fn discover_sessions(conn: &Connection, backstop: u64) -> Vec<SessionNode> {
                 session_uuid: String::new(), // filled in second pass
                 agent_id: None,
                 project_key: pkey,
+                provider: "opencode".to_string(),
                 window,
                 children: Vec::new(),
                 last_turn_at,
                 trend,
                 behavior,
+                source_path: None,
             },
         ));
     }

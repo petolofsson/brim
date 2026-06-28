@@ -296,11 +296,13 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
             session_uuid: uuid,
             agent_id: None,
             project_key: project_key.clone(),
+            provider: "claude".to_string(),
             window,
             children: Vec::new(),
             last_turn_at,
             trend,
             behavior: behavior_signals,
+            source_path: Some(path.clone()),
         });
     }
 
@@ -343,11 +345,13 @@ pub fn discover_project(project_dir: &Path, backstop: u64) -> Vec<SessionNode> {
                     session_uuid: parent_uuid.clone(),
                     agent_id,
                     project_key: project_key.clone(),
+                    provider: "claude".to_string(),
                     window,
                     children: Vec::new(),
                     last_turn_at,
                     trend,
                     behavior: behavior_signals,
+                    source_path: None,
                 });
             }
             child_map.insert(parent_uuid, children);

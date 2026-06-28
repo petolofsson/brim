@@ -358,6 +358,8 @@ pub struct SessionNode {
     pub agent_id: Option<String>,
     /// Encoded project directory name (leading '-' stripped) from ~/.claude/projects/<key>/.
     pub project_key: String,
+    /// Provider that owns this session: "claude" | "opencode" | "copilot" | "codex".
+    pub provider: String,
     pub window: Option<WindowInfo>,
     pub children: Vec<SessionNode>,
     /// Timestamp of the latest assistant turn used for the window computation.
@@ -366,6 +368,9 @@ pub struct SessionNode {
     pub trend: Option<WindowTrend>,
     /// Behavioral degradation signals (ADR-024/ADR-025). None = provider has no tool-use extraction.
     pub behavior: Option<BehaviorSignals>,
+    /// Source JSONL path; populated only for Claude parent sessions to enable the
+    /// harvester's compact_boundary second-read (REQ-017/plan §3). None for all other providers.
+    pub source_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -382,6 +387,7 @@ mod tests {
             session_uuid: uuid.to_string(),
             agent_id: agent_id.map(str::to_string),
             project_key: "test".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: tokens,
                 model: "m".to_string(),
@@ -392,6 +398,7 @@ mod tests {
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         }
     }
 

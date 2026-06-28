@@ -505,6 +505,7 @@ mod tests {
             session_uuid: parent_uuid.to_string(),
             agent_id: Some(child_agent_id.to_string()),
             project_key: "test-project".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 10_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -515,12 +516,14 @@ mod tests {
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
 
         let parent = SessionNode {
             session_uuid: parent_uuid.to_string(),
             agent_id: None,
             project_key: "test-project".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 // 40k: above ABSOLUTE_WATCH_TOKENS (32k), below ABSOLUTE_RECYCLE_BACKSTOP (128k)
                 window_tokens: 40_000,
@@ -532,6 +535,7 @@ mod tests {
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
 
         let parent_si = compute_subtree(&parent, &thresholds);
@@ -565,6 +569,7 @@ mod tests {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
             agent_id: None,
             project_key: "test".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 190_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -575,6 +580,7 @@ mod tests {
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -606,11 +612,13 @@ mod tests {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
             agent_id: None,
             project_key: "test".to_string(),
+            provider: "test".to_string(),
             window: None,
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -633,6 +641,7 @@ mod tests {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
             agent_id: None,
             project_key: "test".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 100_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -652,6 +661,7 @@ mod tests {
                 drift_score: None,
             }),
             behavior: None,
+            source_path: None,
         };
         let node_si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &node_si, None, &thresholds, 30, None);
@@ -681,17 +691,20 @@ mod tests {
             session_uuid: parent_uuid.to_string(),
             agent_id: Some(child_agent.to_string()),
             project_key: "p".to_string(),
+            provider: "test".to_string(),
             window: None,
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
         // root with window + trend (so subtree aggregates and recycle rec populate)
         let parent = SessionNode {
             session_uuid: parent_uuid.to_string(),
             agent_id: None,
             project_key: "p".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 190_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -702,6 +715,7 @@ mod tests {
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
 
         let parent_si = compute_subtree(&parent, &thresholds);
@@ -829,6 +843,7 @@ mod tests {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
             agent_id: None,
             project_key: "test".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 5_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -839,6 +854,7 @@ mod tests {
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
         let si = compute_subtree(&node, &thresholds);
         let jnode = to_json_node(&node, &si, None, &thresholds, 30, None);
@@ -876,17 +892,20 @@ mod tests {
             session_uuid: root_uuid.to_string(),
             agent_id: Some(child_agent.to_string()),
             project_key: "myproject".to_string(),
+            provider: "test".to_string(),
             window: None,
             children: Vec::new(),
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
         // active root with known window_tokens.
         let root = SessionNode {
             session_uuid: root_uuid.to_string(),
             agent_id: None,
             project_key: "myproject".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 50_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -897,6 +916,7 @@ mod tests {
             last_turn_at: None,
             trend: None,
             behavior: None,
+            source_path: None,
         };
 
         let si = compute_subtree(&root, &thresholds);

@@ -113,11 +113,13 @@ fn parse_session_dir(dir: &Path, log_root: &Path, backstop: u64) -> Option<Sessi
         session_uuid: session_id,
         agent_id: None,
         project_key,
+        provider: "copilot".to_string(),
         window,
         children: Vec::new(),
         last_turn_at,
         trend,
         behavior,
+        source_path: None,
     })
 }
 

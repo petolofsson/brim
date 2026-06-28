@@ -1,6 +1,7 @@
 mod claude;
 mod codex;
 mod copilot;
+mod harvest;
 mod model;
 mod opencode;
 mod output;
@@ -12,6 +13,7 @@ mod window;
 use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
+use std::path::PathBuf;
 use claude::ClaudeProvider;
 use codex::CodexProvider;
 use copilot::CopilotProvider;
@@ -62,6 +64,12 @@ struct Cli {
     /// Minutes since last turn for a session to be considered active (default: 30) (REQ-006)
     #[arg(long, default_value_t = 30)]
     active_mins: u32,
+
+    /// Append label records to a JSONL file for offline calibration (REQ-017).
+    /// Never runs by default; must be explicitly specified. Never mutates sessions.
+    /// Tip: pass --all --harvest <path> to capture historical resets in stale sessions.
+    #[arg(long, value_name = "PATH")]
+    harvest: Option<PathBuf>,
 }
 
 pub(crate) fn is_active(node: &SessionNode, active_mins: u32) -> bool {
@@ -148,6 +156,12 @@ fn main() -> Result<()> {
             .then_with(|| sb.worst_tokens.cmp(&sa.worst_tokens))
     });
 
+    if let Some(ref harvest_path) = cli.harvest {
+        let all_sessions: Vec<&SessionNode> = pairs.iter().map(|(_, s)| s).collect();
+        let records = harvest::collect_labels(&all_sessions, &thresholds);
+        harvest::append_records(harvest_path, &records)?;
+    }
+
     if cli.json {
         let output = JsonOutput {
             nodes: pairs
@@ -222,6 +236,7 @@ mod tests {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
             agent_id: None,
             project_key: "test-project".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 100_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -232,6 +247,7 @@ mod tests {
             last_turn_at,
             trend: None,
             behavior: None,
+            source_path: None,
         }
     }
 
@@ -277,6 +293,7 @@ mod tests {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
             agent_id: Some("child000-1111-2222-3333-444455556666".to_string()),
             project_key: "test-project".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 50_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -287,11 +304,13 @@ mod tests {
             last_turn_at: Some(Utc::now() - chrono::Duration::minutes(5)),
             trend: None,
             behavior: None,
+            source_path: None,
         };
         let parent = SessionNode {
             session_uuid: "aaaabbbb-cccc-dddd-eeee-111122223333".to_string(),
             agent_id: None,
             project_key: "test-project".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: 100_000,
                 model: "claude-sonnet-4-6".to_string(),
@@ -302,6 +321,7 @@ mod tests {
             last_turn_at: Some(Utc::now() - chrono::Duration::hours(2)),
             trend: None,
             behavior: None,
+            source_path: None,
         };
         let mut sessions = vec![parent];
         sessions.retain(|s| any_active(s, 30));
@@ -343,6 +363,7 @@ mod tests {
             session_uuid: uuid.to_string(),
             agent_id: agent_id.map(|s| s.to_string()),
             project_key: "test".to_string(),
+            provider: "test".to_string(),
             window: Some(WindowInfo {
                 window_tokens: tokens,
                 model: "claude-sonnet-4-6".to_string(),
@@ -358,6 +379,7 @@ mod tests {
                 drift_score: None,
             }),
             behavior: None,
+            source_path: None,
         }
     }
 

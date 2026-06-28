@@ -73,6 +73,14 @@ fn drift_score_from_slice(points: &[TimelinePoint]) -> Option<f32> {
     Some(last as f32 / floor as f32)
 }
 
+/// Returns the indices of all reset points in the timeline: positions i where
+/// points[i].window_tokens < points[i-1].window_tokens (Q2 — used by harvest.rs).
+pub fn find_reset_indices(points: &[TimelinePoint]) -> Vec<usize> {
+    (1..points.len())
+        .filter(|&i| points[i].window_tokens < points[i - 1].window_tokens)
+        .collect()
+}
+
 /// Derive velocity and projection from a bounded per-turn timeline (ADR-006, ADR-022).
 ///
 /// Velocity = MAX of the most recent VELOCITY_WINDOW_W consecutive positive deltas
@@ -95,12 +103,7 @@ pub fn compute_trend(points: Vec<TimelinePoint>, backstop: u64) -> WindowTrend {
     }
 
     // Find post-reset start: the index of the first point AFTER the last negative delta.
-    let mut post_reset_start = 0usize;
-    for i in 1..points.len() {
-        if points[i].window_tokens < points[i - 1].window_tokens {
-            post_reset_start = i;
-        }
-    }
+    let post_reset_start = find_reset_indices(&points).last().copied().unwrap_or(0);
 
     let post_reset = &points[post_reset_start..];
     if post_reset.len() < 2 {

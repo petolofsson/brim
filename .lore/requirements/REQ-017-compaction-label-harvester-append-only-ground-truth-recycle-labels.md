@@ -1,13 +1,14 @@
 ---
 id: REQ-017
 title: "Recycle-label harvester: append-only ground-truth recycle labels (recycle primary, compaction secondary)"
-status: Draft
+status: Accepted
 related_requirements: []
 related_adrs:
   - ADR-025
+  - ADR-033
 related_stories:
   - STORY-013
-related_tests: []
+related_tests: [TEST-013]
 ---
 
 # REQ-017 - Recycle-label harvester: append-only ground-truth recycle labels (recycle primary, compaction secondary)
@@ -22,11 +23,14 @@ captured and the collection invariants; it does NOT specify the calibration
 algorithm that consumes the labels (out of scope — a separate later unit).
 
 * **Trigger — reuse existing detection, two event types.** A label is produced
-  when, and only when, brim observes a window reset in a session's transcript.
-  Detection shall REUSE brim's existing reset-point detection (the REQ-007
-  timeline drop, already computed today and whose drop magnitude is discarded
-  per REQ-016 Tier-A "compaction-drop magnitude"). No new detection mechanism
-  shall be invented. A window reset arises two ways and each record shall carry
+  when brim observes a window reset, detected two ways: (1) IN-SESSION — the
+  REQ-007 timeline drop within a single transcript (already computed today,
+  drop magnitude discarded per REQ-016 Tier-A "compaction-drop magnitude"; the
+  in-session path invents no new detection mechanism); and (2) CROSS-FILE —
+  cross-file recycle detection is IN SCOPE: an earlier same-project session
+  whose terminal occupancy is >= a 96k harvest gate, followed by a later
+  same-project session, marks the operator's fresh-start recycle (PRIMARY
+  positive label). A window reset arises two ways and each record shall carry
   an `event_type` distinguishing them:
   - `recycle` (PRIMARY) — operator/orchestrator restarted the session at a
     break (a session boundary / fresh-session-with-reset-context). This is the

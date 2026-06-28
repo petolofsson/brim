@@ -7,8 +7,9 @@ related_requirements:
   - REQ-007
 related_adrs:
   - ADR-025
+  - ADR-033
 related_stories: []
-related_tests: []
+related_tests: [TEST-013]
 ---
 
 # STORY-013 - Collect ground-truth recycle labels from operator recycle events (compaction secondary) to calibrate thresholds

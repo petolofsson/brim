@@ -5,6 +5,7 @@ status: Accepted
 related_requirements: [FEATURE-001]
 related_adrs:
   - ADR-010
+  - ADR-033
 related_stories: [STORY-012]
 related_tests: []
 ---

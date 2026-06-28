@@ -215,11 +215,13 @@ fn parse_session_file(path: &Path, backstop: u64) -> Option<SessionNode> {
         session_uuid: session_id,
         agent_id: None,
         project_key,
+        provider: "codex".to_string(),
         window,
         children: Vec::new(),
         last_turn_at,
         trend,
         behavior: extract_codex_behavior(&tail),
+        source_path: None,
     })
 }
 
