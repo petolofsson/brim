@@ -1,3 +1,4 @@
+mod calibrate;
 mod claude;
 mod codex;
 mod copilot;
@@ -27,12 +28,22 @@ use parser::short_id;
 use provider::Provider;
 use verdict::Thresholds;
 
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Offline Behavior-family threshold calibration from public failure datasets.
+    /// Reads operator-downloaded JSONL files; never touches live sessions.
+    Calibrate(calibrate::CalibrateArgs),
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "brim",
     about = "Context-window occupancy for AI coding sessions"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Show orchestrator → sub-agent tree
     #[arg(long)]
     tree: bool,
@@ -85,6 +96,11 @@ fn any_active(node: &SessionNode, active_mins: u32) -> bool {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Commands::Calibrate(args)) = cli.command {
+        return calibrate::run_calibration(&args);
+    }
+
     anyhow::ensure!(
         cli.watch_tokens <= cli.recycle_backstop,
         "--watch-tokens ({}) must be \u{2264} --recycle-backstop ({})",
